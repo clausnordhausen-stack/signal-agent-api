@@ -6,60 +6,62 @@
 
 ## 🚀 Overview
 
-The **Signal Agent API** is a production-grade backend system designed to:
+The **Signal Agent API** is a production-grade backend system that transforms external input into **controlled, traceable and risk-managed decisions**.
 
-* ingest external signals
-* transform them into structured decisions
-* enforce risk constraints
-* control execution across multiple clients
+The system is designed to:
+
+* ingest signals from external sources
+* process and validate decision logic
+* enforce strict risk constraints
+* distribute execution across multiple clients
 
 👉 This is **not a trading bot**
-👉 It is a **controlled decision system**
+👉 This is a **decision system with execution control**
 
 ---
 
 ## 🧠 Core Idea
 
-Most automation systems focus on execution.
+Most systems automate execution.
 
-This system focuses on **decision control**.
+This system controls **decision quality**.
 
-Every incoming signal is:
+Every signal passes a structured pipeline:
 
-1. validated
-2. filtered
-3. risk-checked
-4. approved or rejected
-5. tracked and fed back into the system
+1. ingestion
+2. normalization
+3. validation
+4. decision logic
+5. risk control
+6. execution approval
+7. tracking and feedback
 
 ---
 
-## 🏗️ Architecture
+## 🏗️ System Flow
 
-```mermaid
-flowchart TD
-
-A[External Signal (TradingView / API)] --> B[Signal Ingestion]
-
-B --> C[Normalization Layer]
-C --> D[Decision Engine]
-
-D --> E[Gate System]
-D --> F[AI Decision Layer]
-
-E --> G[Execution Approval]
-
-F --> G
-
-G --> H[Execution Clients (MT5)]
-
-H --> I[Deals / Results]
-
-I --> J[KPI Engine]
-
-J --> K[Auto Gate System]
-
-K --> E
+```text
+External Signal
+   ↓
+Signal Ingestion
+   ↓
+Normalization Layer
+   ↓
+Decision Engine
+   ↓
+Gate System + AI Layer
+   ↓
+Execution Approval
+   ↓
+Execution Clients (MT5)
+   ↓
+Deals / Results
+   ↓
+KPI Engine
+   ↓
+Auto Gate System
+   ↓
+Feedback into system
 ```
 
 ---
@@ -70,24 +72,24 @@ K --> E
 
 * accepts external signals (`/tv`)
 * normalizes input (BUY / SELL logic)
-* deduplicates repeated signals
-* ensures one active signal per symbol
+* removes duplicates
+* enforces one active signal per symbol
 
 ---
 
 ### 2. Decision Engine
 
-* transforms signals into executable decisions
-* enforces deterministic validation
+* transforms signals into structured decisions
+* applies deterministic logic
 * prevents uncontrolled execution
 
 ---
 
 ### 3. Gate System
 
-* dynamic system state: **GREEN / YELLOW / RED**
-* controls whether execution is allowed
-* adjusts risk exposure
+* system states: **GREEN / YELLOW / RED**
+* controls if execution is allowed
+* dynamically adjusts risk exposure
 
 ---
 
@@ -95,7 +97,7 @@ K --> E
 
 * daily loss limits
 * R-multiple tracking
-* trade limits per day
+* max trades per day
 * margin constraints
 
 ---
@@ -105,7 +107,7 @@ K --> E
 * distributes decisions to multiple clients
 * enforces:
 
-  * one signal → controlled execution
+  * one signal → one controlled execution
   * no duplicate trades
   * cooldown logic
 
@@ -113,7 +115,7 @@ K --> E
 
 ### 6. KPI Engine
 
-* tracks:
+* tracks performance:
 
   * drawdown
   * winrate
@@ -124,7 +126,7 @@ K --> E
 
 ### 7. Auto Gate System
 
-* dynamically adjusts system behavior based on KPIs
+* adjusts system behavior dynamically
 
 Example:
 
@@ -135,21 +137,21 @@ Example:
 
 ## 🤖 AI Decision Layer
 
-This system integrates AI as a **bounded reasoning component**.
+The system integrates AI as a **bounded and controlled reasoning component**.
 
 AI is used to:
 
-* interpret complex signal structures
+* interpret complex inputs
 * support decision scoring
-* enhance filtering logic
+* enhance rule-based filtering
 
 AI is NOT allowed to:
 
-* execute trades directly
+* execute trades
 * override risk constraints
 * bypass validation logic
 
-👉 All AI output is validated by deterministic rules
+👉 Final decisions are always enforced by deterministic rules
 
 ---
 
@@ -160,31 +162,31 @@ Signal received
    ↓
 Normalized
    ↓
-Checked (duplicate / cooldown)
+Duplicate / cooldown check
    ↓
-Evaluated (Decision Engine + AI)
+Decision evaluation (rules + AI)
    ↓
-Validated (Gate + Risk)
+Risk validation
    ↓
 Approved / Rejected
    ↓
-Executed (client)
+Executed
    ↓
 Tracked (deals + KPIs)
    ↓
-Feedback into system (Auto Gate)
+Feedback into system
 ```
 
 ---
 
-## 🔐 Key Design Principles
+## 🔐 Design Principles
 
 * deterministic core logic
 * strict separation of concerns
-* full traceability (signal → decision → trade → KPI)
+* full traceability
 * no black-box execution
-* system-level risk control
-* multi-client scalability
+* system-level risk governance
+* scalable multi-client architecture
 
 ---
 
@@ -192,29 +194,29 @@ Feedback into system (Auto Gate)
 
 The system supports:
 
-* multiple accounts
-* multiple strategies
-* independent execution contexts
+* multiple trading accounts
+* independent execution per client
+* per-client signal acknowledgment
 
 Each client:
 
 * receives signals independently
-* acknowledges execution (`/ack`)
+* confirms execution (`/ack`)
 * is tracked individually
 
 ---
 
-## 📡 API Endpoints (Core)
+## 📡 API Endpoints
 
-| Endpoint             | Purpose              |
-| -------------------- | -------------------- |
-| `/tv`                | Signal ingestion     |
-| `/latest`            | Fetch decision       |
-| `/ack`               | Confirm execution    |
-| `/status/gate_combo` | System state         |
-| `/risk`              | Risk tracking        |
-| `/deal`              | Trade reporting      |
-| `/hb`                | Heartbeat monitoring |
+| Endpoint             | Purpose               |
+| -------------------- | --------------------- |
+| `/tv`                | Signal ingestion      |
+| `/latest`            | Fetch latest decision |
+| `/ack`               | Confirm execution     |
+| `/status/gate_combo` | System state          |
+| `/risk`              | Risk tracking         |
+| `/deal`              | Trade reporting       |
+| `/hb`                | Heartbeat monitoring  |
 
 ---
 
@@ -223,8 +225,8 @@ Each client:
 * Python 3.10+
 * FastAPI
 * SQLite
-* REST API architecture
-* OpenAI API (AI decision layer)
+* REST architecture
+* OpenAI API
 
 ---
 
@@ -239,13 +241,14 @@ uvicorn app:app --reload
 
 ## 📊 What Makes This System Different
 
-This system does NOT automate blindly.
+This system does not automate blindly.
 
 It introduces:
 
-* controlled decision-making
+* structured decision pipelines
 * enforceable risk constraints
-* system-level governance
+* full transparency
+* controlled execution
 
 👉 Every action is explainable
 👉 Every decision is traceable
@@ -254,12 +257,12 @@ It introduces:
 
 ## 🧠 Business Perspective
 
-This architecture is designed for:
+The system is designed for:
 
-* scalable automation systems
-* AI-assisted decision platforms
-* regulated environments
-* multi-client deployment
+* scalable automation platforms
+* AI-assisted decision systems
+* multi-client environments
+* controlled execution scenarios
 
 ---
 
