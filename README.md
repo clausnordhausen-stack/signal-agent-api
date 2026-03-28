@@ -41,27 +41,68 @@ Every signal passes a structured pipeline:
 ## 🏗️ System Flow
 
 ```text
-External Signal
-   ↓
-Signal Ingestion
-   ↓
-Normalization Layer
-   ↓
-Decision Engine
-   ↓
-Gate System + AI Layer
-   ↓
-Execution Approval
-   ↓
-Execution Clients (MT5)
-   ↓
-Deals / Results
-   ↓
-KPI Engine
-   ↓
-Auto Gate System
-   ↓
-Feedback into system
+┌───────────────────────────────────────────────┐
+│              EXTERNAL SIGNAL SOURCES          │
+│     TradingView / API / AI / External Input   │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│               SIGNAL INGESTION                │
+│                     /tv                       │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│             NORMALIZATION LAYER               │
+│   BUY/SELL mapping · payload cleanup · dedup  │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│               DECISION ENGINE                 │
+│     deterministic rules + structured logic    │
+└───────────────┬─────────────────────┬─────────┘
+                │                     │
+                ▼                     ▼
+┌──────────────────────────┐   ┌──────────────────────────┐
+│       GATE SYSTEM        │   │     AI DECISION LAYER    │
+│   GREEN / YELLOW / RED   │   │ bounded AI assistance    │
+└───────────────┬──────────┘   └───────────────┬──────────┘
+                │                              │
+                └──────────────┬───────────────┘
+                               │
+                               ▼
+┌───────────────────────────────────────────────┐
+│              EXECUTION APPROVAL               │
+│  only approved, valid, risk-compliant actions │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│             EXECUTION CLIENTS (MT5)           │
+│        multi-account controlled delivery      │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│                DEALS / RESULTS                │
+│        fills · outcomes · execution state     │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│                  KPI ENGINE                   │
+│ drawdown · winrate · R-multiple · loss streak │
+└───────────────────────┬───────────────────────┘
+                        │
+                        ▼
+┌───────────────────────────────────────────────┐
+│               AUTO GATE SYSTEM                │
+│      adaptive feedback into future decisions  │
+└───────────────────────┬───────────────────────┘
+                        │
+                        └────── feedback loop ──────► Gate / Risk Logic
 ```
 
 ---
@@ -158,23 +199,60 @@ AI is NOT allowed to:
 ## 🔁 Signal Lifecycle
 
 ```text
-Signal received
-   ↓
-Normalized
-   ↓
-Duplicate / cooldown check
-   ↓
-Decision evaluation (rules + AI)
-   ↓
-Risk validation
-   ↓
-Approved / Rejected
-   ↓
-Executed
-   ↓
-Tracked (deals + KPIs)
-   ↓
-Feedback into system
+┌───────────────┐
+│ Signal Input  │
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│  Normalized   │
+└───────┬───────┘
+        │
+        ▼
+┌──────────────────────────────┐
+│ Duplicate / Cooldown Check   │
+└───────┬──────────────────────┘
+        │
+        ▼
+┌──────────────────────────────┐
+│ Decision Evaluation          │
+│ Rules + AI-assisted scoring  │
+└───────┬──────────────────────┘
+        │
+        ▼
+┌──────────────────────────────┐
+│ Risk Validation              │
+│ caps · limits · gate status  │
+└───────┬──────────────────────┘
+        │
+        ▼
+   ┌───────────────┐
+   │ Approved ?    │
+   └──────┬────────┘
+          │
+     ┌────┴────┐
+     │         │
+     ▼         ▼
+┌──────────┐  ┌──────────┐
+│ Approved │  │ Rejected │
+└────┬─────┘  └────┬─────┘
+     │             │
+     ▼             ▼
+┌──────────┐   ┌───────────────┐
+│Executed  │   │Logged / Stored │
+└────┬─────┘   └───────────────┘
+     │
+     ▼
+┌───────────────┐
+│Tracked        │
+│deals + KPIs   │
+└───────┬───────┘
+        │
+        ▼
+┌───────────────┐
+│Feedback Loop  │
+│gate adaption  │
+└───────────────┘
 ```
 
 ---
@@ -208,15 +286,17 @@ Each client:
 
 ## 📡 API Endpoints
 
-| Endpoint             | Purpose               |
-| -------------------- | --------------------- |
-| `/tv`                | Signal ingestion      |
-| `/latest`            | Fetch latest decision |
-| `/ack`               | Confirm execution     |
-| `/status/gate_combo` | System state          |
-| `/risk`              | Risk tracking         |
-| `/deal`              | Trade reporting       |
-| `/hb`                | Heartbeat monitoring  |
+| Endpoint              | Purpose                                     |
+| --------------------- | ------------------------------------------- |
+| `/tv`                 | Signal ingestion                            |
+| `/latest`             | Fetch latest decision                       |
+| `/ack`                | Confirm execution                           |
+| `/status/gate_combo`  | System state                                |
+| `/risk`               | Risk tracking                               |
+| `/deal`               | Trade reporting                             |
+| `/hb`                 | Heartbeat monitoring                        |
+| `/ai/explain_signal`  | AI-based signal explanation                 |
+| `/ai/decision_assist` | AI-supported structured decision assistance |
 
 ---
 
@@ -275,5 +355,6 @@ The system is designed for:
 
 ## 📫 Contact
 
-Claus Nordhausen
+**Claus Nordhausen**
 📧 [claus@nordhausen.me](mailto:claus@nordhausen.me)
+🔗 https://github.com/clausnordhausen-stack
