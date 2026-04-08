@@ -339,102 +339,68 @@ class RiskIn(BaseModel):
 
 
 # -------------------------------------------------------------------
-# BASIC ROUTES
+# INTERNAL CORE HELPERS
 # -------------------------------------------------------------------
-@app.get("/")
-def root():
-    return {
-        "ok": True,
-        "service": "Signal Agent API",
-        "version": "6.1.0",
-        "server_time_utc": utc_iso()
-    }
-
-
-@app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "signal-agent-api",
-        "time": utc_iso()
-    }
-
-
-# -------------------------------------------------------------------
-# AUTH ROUTES
-# -------------------------------------------------------------------
-@app.post("/login", response_model=TokenResponse)
-def login(data: LoginRequest):
-    username = data.username.strip()
-    password = data.password.strip()
-
-    if username != APP_USERNAME or password != APP_PASSWORD:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
-
-    access_token = create_access_token({"sub": username})
-    return {
-        "access_token": access_token,
-        "token_type": "bearer"
-    }
-
-
-@app.get("/me", response_model=UserResponse)
-def me(current_user: dict = Depends(get_current_user)):
-    return {"username": current_user["username"]}
-
-
-# -------------------------------------------------------------------
-# SIGNAL ROUTES
-# -------------------------------------------------------------------
-@app.post("/tv")
-def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None)):
-    req_key = (x_api_key or data.key or "").strip()
-    if req_key != TV_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
-
-    symbol = data.symbol.strip().upper()
-
-    side_raw = (data.side or data.action or "").strip().upper()
-    if side_raw in ["BUY", "LONG"]:
-        side = "BUY"
-    elif side_raw in ["SELL", "SHORT"]:
-        side = "SELL"
-    else:
-        side = ""
-
-    payload = data.payload or {}
-    payload["tv_id"] = data.id
-    payload["tv_ts"] = data.ts
-    payload["raw_action"] = data.action
-    payload_json = json.dumps(payload, ensure_ascii=False)
-
-    now = utc_iso()
+def build_heartbeat_status(symbol: Optional[str] = None) -> Dict[str, Any]:
+    symbol_norm = symbol.strip().upper() if symbol else None
+    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
 
     with DB_LOCK:
         conn = get_conn()
         cur = conn.cursor()
 
-        cur.execute("""
-        INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
-        """, (symbol, side, payload_json, now, now))
+        if symbol_norm:
+            cur.execute("""
+            SELECT * FROM heartbeats
+            WHERE symbol = ?
+            ORDER BY id DESC
+            LIMIT 200
+            """, (symbol_norm,))
+        else:
+            cur.execute("""
+            SELECT * FROM heartbeats
+            ORDER BY id DESC
+            LIMIT 500
+            """)
 
-        signal_id = cur.lastrowid
-        conn.commit()
+        rows = cur.fetchall()
         conn.close()
+
+    latest_map = {}
+    for r in rows:
+        key = f"{r.get('account','')}|{r.get('magic','')}|{r.get('symbol','')}"
+        if key not in latest_map:
+            latest_map[key] = r
+
+    result = []
+    connected_count = 0
+
+    for _, r in latest_map.items():
+        last_seen = parse_dt(r["last_seen_utc"])
+        connected = bool(last_seen and last_seen >= cutoff)
+        if connected:
+            connected_count += 1
+
+        result.append({
+            "account": r.get("account"),
+            "magic": r.get("magic"),
+            "symbol": r.get("symbol"),
+            "ea_name": r.get("ea_name"),
+            "version": r.get("version"),
+            "last_seen_utc": r.get("last_seen_utc"),
+            "connected": connected,
+            "status": r.get("status"),
+            "comment": r.get("comment"),
+        })
 
     return {
         "ok": True,
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "side": side,
-        "created_utc": now
+        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
+        "connected_count": connected_count,
+        "items": result
     }
 
 
-# -------------------------------------------------------------------
-# KPI CORE
-# -------------------------------------------------------------------
 def get_deals_filtered(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
@@ -663,10 +629,7 @@ def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
     }
 
 
-# -------------------------------------------------------------------
-# INTERNAL GATE HELPERS
-# -------------------------------------------------------------------
-def compute_gate_auto(
+def build_gate_auto(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
     magic: Optional[str] = None,
@@ -698,21 +661,13 @@ def compute_gate_auto(
     }
 
 
-def compute_gate_combo(
+def build_gate_combo(
     symbol: Optional[str] = None,
     account: Optional[str] = None,
     magic: Optional[str] = None,
-    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
-    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
 ) -> Dict[str, Any]:
     controls = get_runtime_controls(symbol)
-    auto_payload = compute_gate_auto(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades
-    )
+    auto_payload = build_gate_auto(symbol=symbol, account=account, magic=magic)
     auto_gate = auto_payload["gate"]
 
     paused = bool(controls["paused"])
@@ -746,6 +701,100 @@ def compute_gate_combo(
     }
 
 
+# -------------------------------------------------------------------
+# BASIC ROUTES
+# -------------------------------------------------------------------
+@app.get("/")
+def root():
+    return {
+        "ok": True,
+        "service": "Signal Agent API",
+        "version": "6.1.0",
+        "server_time_utc": utc_iso()
+    }
+
+
+@app.get("/health")
+def health():
+    return {
+        "status": "ok",
+        "service": "signal-agent-api",
+        "time": utc_iso()
+    }
+
+
+# -------------------------------------------------------------------
+# AUTH ROUTES
+# -------------------------------------------------------------------
+@app.post("/login", response_model=TokenResponse)
+def login(data: LoginRequest):
+    username = data.username.strip()
+    password = data.password.strip()
+
+    if username != APP_USERNAME or password != APP_PASSWORD:
+        raise HTTPException(status_code=401, detail="Invalid username or password")
+
+    access_token = create_access_token({"sub": username})
+    return {
+        "access_token": access_token,
+        "token_type": "bearer"
+    }
+
+
+@app.get("/me", response_model=UserResponse)
+def me(current_user: dict = Depends(get_current_user)):
+    return {"username": current_user["username"]}
+
+
+# -------------------------------------------------------------------
+# SIGNAL ROUTES
+# -------------------------------------------------------------------
+@app.post("/tv")
+def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None)):
+    req_key = (x_api_key or data.key or "").strip()
+    if req_key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid API key")
+
+    symbol = data.symbol.strip().upper()
+
+    side_raw = (data.side or data.action or "").strip().upper()
+    if side_raw in ["BUY", "LONG"]:
+        side = "BUY"
+    elif side_raw in ["SELL", "SHORT"]:
+        side = "SELL"
+    else:
+        side = ""
+
+    payload = data.payload or {}
+    payload["tv_id"] = data.id
+    payload["tv_ts"] = data.ts
+    payload["raw_action"] = data.action
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
+    now = utc_iso()
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+
+        cur.execute("""
+        INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
+        VALUES (?, ?, ?, ?, ?, 'pending')
+        """, (symbol, side, payload_json, now, now))
+
+        signal_id = cur.lastrowid
+        conn.commit()
+        conn.close()
+
+    return {
+        "ok": True,
+        "signal_id": signal_id,
+        "symbol": symbol,
+        "side": side,
+        "created_utc": now
+    }
+
+
 @app.get("/latest")
 def latest_signal(
     symbol: str = Query(...),
@@ -756,7 +805,7 @@ def latest_signal(
     account = account.strip()
 
     controls = get_runtime_controls(symbol)
-    gate_payload = compute_gate_combo(symbol=symbol, account=account, magic=magic)
+    gate_payload = build_gate_combo(symbol=symbol, account=account, magic=magic)
 
     if controls["paused"] or not controls["allow_new_entries"] or not gate_payload["allow_new_entries"]:
         return {
@@ -899,63 +948,7 @@ def heartbeat(data: HeartbeatPing):
 
 @app.get("/status/heartbeat")
 def heartbeat_status(symbol: Optional[str] = Query(default=None)):
-    symbol_norm = symbol.strip().upper() if symbol else None
-    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        if symbol_norm:
-            cur.execute("""
-            SELECT * FROM heartbeats
-            WHERE symbol = ?
-            ORDER BY id DESC
-            LIMIT 200
-            """, (symbol_norm,))
-        else:
-            cur.execute("""
-            SELECT * FROM heartbeats
-            ORDER BY id DESC
-            LIMIT 500
-            """)
-
-        rows = cur.fetchall()
-        conn.close()
-
-    latest_map = {}
-    for r in rows:
-        key = f"{r.get('account','')}|{r.get('magic','')}|{r.get('symbol','')}"
-        if key not in latest_map:
-            latest_map[key] = r
-
-    result = []
-    connected_count = 0
-
-    for _, r in latest_map.items():
-        last_seen = parse_dt(r["last_seen_utc"])
-        connected = bool(last_seen and last_seen >= cutoff)
-        if connected:
-            connected_count += 1
-
-        result.append({
-            "account": r.get("account"),
-            "magic": r.get("magic"),
-            "symbol": r.get("symbol"),
-            "ea_name": r.get("ea_name"),
-            "version": r.get("version"),
-            "last_seen_utc": r.get("last_seen_utc"),
-            "connected": connected,
-            "status": r.get("status"),
-            "comment": r.get("comment"),
-        })
-
-    return {
-        "ok": True,
-        "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
-        "connected_count": connected_count,
-        "items": result
-    }
+    return build_heartbeat_status(symbol=symbol)
 
 
 # -------------------------------------------------------------------
@@ -1054,12 +1047,12 @@ def gate_auto(
     lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
     limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    return compute_gate_auto(
+    return build_gate_auto(
         symbol=symbol,
         account=account,
         magic=magic,
         lookback_days=lookback_days,
-        limit_trades=limit_trades
+        limit_trades=limit_trades,
     )
 
 
@@ -1068,16 +1061,8 @@ def gate_combo(
     symbol: Optional[str] = Query(default=None),
     account: Optional[str] = Query(default=None),
     magic: Optional[str] = Query(default=None),
-    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
-    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    return compute_gate_combo(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades
-    )
+    return build_gate_combo(symbol=symbol, account=account, magic=magic)
 
 
 # -------------------------------------------------------------------
@@ -1131,20 +1116,11 @@ def system_overview(
     )
 
     kpis = summarize_kpis(rows)
-    gate = compute_gate_combo(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades
-    )
+    gate = build_gate_combo(symbol=symbol, account=account, magic=magic)
 
     heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
     try:
-        if symbol:
-            heartbeat_payload = heartbeat_status(symbol=symbol)
-        else:
-            heartbeat_payload = heartbeat_status()
+        heartbeat_payload = build_heartbeat_status(symbol=symbol)
     except Exception:
         pass
 
