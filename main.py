@@ -432,6 +432,320 @@ def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None))
     }
 
 
+# -------------------------------------------------------------------
+# KPI CORE
+# -------------------------------------------------------------------
+def get_deals_filtered(
+    symbol: Optional[str] = None,
+    account: Optional[str] = None,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+):
+    dt_from = now_utc() - timedelta(days=lookback_days)
+
+    query = """
+    SELECT *
+    FROM deals
+    WHERE deal_time_utc >= ?
+    """
+    params = [utc_iso(dt_from)]
+
+    if symbol:
+        query += " AND symbol = ?"
+        params.append(symbol.upper())
+
+    if account:
+        query += " AND account = ?"
+        params.append(account)
+
+    if magic:
+        query += " AND magic = ?"
+        params.append(magic)
+
+    query += " ORDER BY deal_time_utc DESC LIMIT ?"
+    params.append(limit_trades)
+
+    with DB_LOCK:
+        conn = get_conn()
+        cur = conn.cursor()
+        cur.execute(query, params)
+        rows = cur.fetchall()
+        conn.close()
+
+    rows = list(reversed(rows))
+    return rows
+
+
+def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
+    curve = [0.0]
+    running = 0.0
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        running += pnl
+        curve.append(running)
+    return curve
+
+
+def calc_max_drawdown_abs(curve: List[float]) -> float:
+    peak = -10**18
+    max_dd = 0.0
+    for x in curve:
+        if x > peak:
+            peak = x
+        dd = peak - x
+        if dd > max_dd:
+            max_dd = dd
+    return max_dd
+
+
+def calc_max_drawdown_pct(curve: List[float]) -> float:
+    peak = None
+    max_dd_pct = 0.0
+    for x in curve:
+        if peak is None or x > peak:
+            peak = x
+        if peak and peak > 0:
+            dd_pct = ((peak - x) / peak) * 100.0
+            if dd_pct > max_dd_pct:
+                max_dd_pct = dd_pct
+    return max_dd_pct
+
+
+def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
+    streak = 0
+    max_streak = 0
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        if pnl < 0:
+            streak += 1
+            max_streak = max(max_streak, streak)
+        else:
+            streak = 0
+    return max_streak
+
+
+def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
+    streak = 0
+    for r in reversed(rows):
+        pnl = safe_float(r.get("pnl"), 0.0)
+        if pnl < 0:
+            streak += 1
+        else:
+            break
+    return streak
+
+
+def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
+    total_trades = len(rows)
+    wins = 0
+    losses = 0
+    breakeven = 0
+
+    gross_profit = 0.0
+    gross_loss = 0.0
+    net_pnl = 0.0
+    total_r = 0.0
+
+    for r in rows:
+        pnl = safe_float(r.get("pnl"), 0.0)
+        r_mult = safe_float(r.get("r_multiple"), 0.0)
+
+        net_pnl += pnl
+        total_r += r_mult
+
+        if pnl > 0:
+            wins += 1
+            gross_profit += pnl
+        elif pnl < 0:
+            losses += 1
+            gross_loss += abs(pnl)
+        else:
+            breakeven += 1
+
+    winrate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    avg_pnl = (net_pnl / total_trades) if total_trades > 0 else 0.0
+    avg_r = (total_r / total_trades) if total_trades > 0 else 0.0
+    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
+
+    curve = calc_equity_curve_from_pnl(rows)
+    max_dd_abs = calc_max_drawdown_abs(curve)
+    max_dd_pct = calc_max_drawdown_pct(curve)
+    max_loss_streak = calc_loss_streak(rows)
+    current_loss_streak = calc_current_loss_streak(rows)
+
+    last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
+
+    return {
+        "total_trades": total_trades,
+        "wins": wins,
+        "losses": losses,
+        "breakeven": breakeven,
+        "winrate_pct": round(winrate, 2),
+        "gross_profit": round(gross_profit, 2),
+        "gross_loss": round(gross_loss, 2),
+        "net_pnl": round(net_pnl, 2),
+        "avg_pnl": round(avg_pnl, 2),
+        "sum_r": round(total_r, 2),
+        "avg_r": round(avg_r, 2),
+        "profit_factor": round(profit_factor, 2),
+        "max_drawdown_abs": round(max_dd_abs, 2),
+        "max_drawdown_pct": round(max_dd_pct, 2),
+        "max_loss_streak": max_loss_streak,
+        "current_loss_streak": current_loss_streak,
+        "last_trade_time_utc": last_trade_time,
+    }
+
+
+def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
+    if not AUTO_GATE_ENABLED:
+        return {
+            "gate_level": DEFAULT_GATE_LEVEL,
+            "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
+            "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
+            "reasons": ["AUTO_GATE_DISABLED"]
+        }
+
+    reasons_red = []
+    reasons_yellow = []
+
+    dd_pct = safe_float(kpi.get("max_drawdown_pct"))
+    cur_loss_streak = safe_int(kpi.get("current_loss_streak"))
+    sum_r = safe_float(kpi.get("sum_r"))
+    winrate = safe_float(kpi.get("winrate_pct"))
+    total_trades = safe_int(kpi.get("total_trades"))
+
+    if dd_pct >= RED_DD_PCT:
+        reasons_red.append(f"MAX_DD_PCT>={RED_DD_PCT}")
+
+    if cur_loss_streak >= RED_LOSS_STREAK:
+        reasons_red.append(f"LOSS_STREAK>={RED_LOSS_STREAK}")
+
+    if sum_r <= RED_R_SUM:
+        reasons_red.append(f"SUM_R<={RED_R_SUM}")
+
+    if total_trades >= 5 and winrate < RED_WINRATE_MIN:
+        reasons_red.append(f"WINRATE<{RED_WINRATE_MIN}")
+
+    if reasons_red:
+        return {
+            "gate_level": "RED",
+            "allow_new_entries": False,
+            "risk_multiplier": 0.0,
+            "reasons": reasons_red
+        }
+
+    if dd_pct >= YELLOW_DD_PCT:
+        reasons_yellow.append(f"MAX_DD_PCT>={YELLOW_DD_PCT}")
+
+    if cur_loss_streak >= YELLOW_LOSS_STREAK:
+        reasons_yellow.append(f"LOSS_STREAK>={YELLOW_LOSS_STREAK}")
+
+    if sum_r <= YELLOW_R_SUM:
+        reasons_yellow.append(f"SUM_R<={YELLOW_R_SUM}")
+
+    if total_trades >= 5 and winrate < YELLOW_WINRATE_MIN:
+        reasons_yellow.append(f"WINRATE<{YELLOW_WINRATE_MIN}")
+
+    if reasons_yellow:
+        return {
+            "gate_level": "YELLOW",
+            "allow_new_entries": True,
+            "risk_multiplier": 0.5,
+            "reasons": reasons_yellow
+        }
+
+    return {
+        "gate_level": "GREEN",
+        "allow_new_entries": True,
+        "risk_multiplier": 1.0,
+        "reasons": ["NORMAL"]
+    }
+
+
+# -------------------------------------------------------------------
+# INTERNAL GATE HELPERS
+# -------------------------------------------------------------------
+def compute_gate_auto(
+    symbol: Optional[str] = None,
+    account: Optional[str] = None,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+) -> Dict[str, Any]:
+    rows = get_deals_filtered(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+
+    kpis = summarize_kpis(rows)
+    gate = auto_gate_from_kpis(kpis)
+
+    return {
+        "ok": True,
+        "filters": {
+            "symbol": symbol.upper() if symbol else None,
+            "account": account,
+            "magic": magic,
+            "lookback_days": lookback_days,
+            "limit_trades": limit_trades,
+        },
+        "kpis": kpis,
+        "gate": gate
+    }
+
+
+def compute_gate_combo(
+    symbol: Optional[str] = None,
+    account: Optional[str] = None,
+    magic: Optional[str] = None,
+    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
+    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
+) -> Dict[str, Any]:
+    controls = get_runtime_controls(symbol)
+    auto_payload = compute_gate_auto(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
+    auto_gate = auto_payload["gate"]
+
+    paused = bool(controls["paused"])
+    controls_allow = bool(controls["allow_new_entries"])
+    auto_allow = bool(auto_gate["allow_new_entries"])
+
+    allow_new_entries = (not paused) and controls_allow and auto_allow
+    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
+
+    gate_level = auto_gate["gate_level"]
+    if paused:
+        gate_level = "RED"
+
+    reasons = []
+    if paused:
+        reasons.append("PAUSED")
+    if not controls_allow:
+        reasons.append("CONTROL_BLOCK")
+    reasons.extend(auto_gate.get("reasons", []))
+
+    return {
+        "ok": True,
+        "symbol": symbol.upper() if symbol else None,
+        "gate_level": gate_level,
+        "allow_new_entries": allow_new_entries,
+        "risk_multiplier": round(final_risk_multiplier, 4),
+        "paused": paused,
+        "controls": controls,
+        "auto_gate": auto_gate,
+        "reasons": reasons
+    }
+
+
 @app.get("/latest")
 def latest_signal(
     symbol: str = Query(...),
@@ -442,7 +756,7 @@ def latest_signal(
     account = account.strip()
 
     controls = get_runtime_controls(symbol)
-    gate_payload = gate_combo(symbol=symbol, account=account, magic=magic)
+    gate_payload = compute_gate_combo(symbol=symbol, account=account, magic=magic)
 
     if controls["paused"] or not controls["allow_new_entries"] or not gate_payload["allow_new_entries"]:
         return {
@@ -719,237 +1033,6 @@ def post_risk(data: RiskIn):
 
 
 # -------------------------------------------------------------------
-# KPI CORE
-# -------------------------------------------------------------------
-def get_deals_filtered(
-    symbol: Optional[str] = None,
-    account: Optional[str] = None,
-    magic: Optional[str] = None,
-    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
-    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
-):
-    dt_from = now_utc() - timedelta(days=lookback_days)
-
-    query = """
-    SELECT *
-    FROM deals
-    WHERE deal_time_utc >= ?
-    """
-    params = [utc_iso(dt_from)]
-
-    if symbol:
-        query += " AND symbol = ?"
-        params.append(symbol.upper())
-
-    if account:
-        query += " AND account = ?"
-        params.append(account)
-
-    if magic:
-        query += " AND magic = ?"
-        params.append(magic)
-
-    query += " ORDER BY deal_time_utc DESC LIMIT ?"
-    params.append(limit_trades)
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
-
-    rows = list(reversed(rows))
-    return rows
-
-
-def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
-    curve = [0.0]
-    running = 0.0
-    for r in rows:
-        pnl = safe_float(r.get("pnl"), 0.0)
-        running += pnl
-        curve.append(running)
-    return curve
-
-
-def calc_max_drawdown_abs(curve: List[float]) -> float:
-    peak = -10**18
-    max_dd = 0.0
-    for x in curve:
-        if x > peak:
-            peak = x
-        dd = peak - x
-        if dd > max_dd:
-            max_dd = dd
-    return max_dd
-
-
-def calc_max_drawdown_pct(curve: List[float]) -> float:
-    peak = None
-    max_dd_pct = 0.0
-    for x in curve:
-        if peak is None or x > peak:
-            peak = x
-        if peak and peak > 0:
-            dd_pct = ((peak - x) / peak) * 100.0
-            if dd_pct > max_dd_pct:
-                max_dd_pct = dd_pct
-    return max_dd_pct
-
-
-def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
-    streak = 0
-    max_streak = 0
-    for r in rows:
-        pnl = safe_float(r.get("pnl"), 0.0)
-        if pnl < 0:
-            streak += 1
-            max_streak = max(max_streak, streak)
-        else:
-            streak = 0
-    return max_streak
-
-
-def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
-    streak = 0
-    for r in reversed(rows):
-        pnl = safe_float(r.get("pnl"), 0.0)
-        if pnl < 0:
-            streak += 1
-        else:
-            break
-    return streak
-
-
-def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
-    total_trades = len(rows)
-    wins = 0
-    losses = 0
-    breakeven = 0
-
-    gross_profit = 0.0
-    gross_loss = 0.0
-    net_pnl = 0.0
-    total_r = 0.0
-
-    for r in rows:
-        pnl = safe_float(r.get("pnl"), 0.0)
-        r_mult = safe_float(r.get("r_multiple"), 0.0)
-
-        net_pnl += pnl
-        total_r += r_mult
-
-        if pnl > 0:
-            wins += 1
-            gross_profit += pnl
-        elif pnl < 0:
-            losses += 1
-            gross_loss += abs(pnl)
-        else:
-            breakeven += 1
-
-    winrate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
-    avg_pnl = (net_pnl / total_trades) if total_trades > 0 else 0.0
-    avg_r = (total_r / total_trades) if total_trades > 0 else 0.0
-    profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
-
-    curve = calc_equity_curve_from_pnl(rows)
-    max_dd_abs = calc_max_drawdown_abs(curve)
-    max_dd_pct = calc_max_drawdown_pct(curve)
-    max_loss_streak = calc_loss_streak(rows)
-    current_loss_streak = calc_current_loss_streak(rows)
-
-    last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
-
-    return {
-        "total_trades": total_trades,
-        "wins": wins,
-        "losses": losses,
-        "breakeven": breakeven,
-        "winrate_pct": round(winrate, 2),
-        "gross_profit": round(gross_profit, 2),
-        "gross_loss": round(gross_loss, 2),
-        "net_pnl": round(net_pnl, 2),
-        "avg_pnl": round(avg_pnl, 2),
-        "sum_r": round(total_r, 2),
-        "avg_r": round(avg_r, 2),
-        "profit_factor": round(profit_factor, 2),
-        "max_drawdown_abs": round(max_dd_abs, 2),
-        "max_drawdown_pct": round(max_dd_pct, 2),
-        "max_loss_streak": max_loss_streak,
-        "current_loss_streak": current_loss_streak,
-        "last_trade_time_utc": last_trade_time,
-    }
-
-
-def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
-    if not AUTO_GATE_ENABLED:
-        return {
-            "gate_level": DEFAULT_GATE_LEVEL,
-            "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
-            "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
-            "reasons": ["AUTO_GATE_DISABLED"]
-        }
-
-    reasons_red = []
-    reasons_yellow = []
-
-    dd_pct = safe_float(kpi.get("max_drawdown_pct"))
-    cur_loss_streak = safe_int(kpi.get("current_loss_streak"))
-    sum_r = safe_float(kpi.get("sum_r"))
-    winrate = safe_float(kpi.get("winrate_pct"))
-    total_trades = safe_int(kpi.get("total_trades"))
-
-    if dd_pct >= RED_DD_PCT:
-        reasons_red.append(f"MAX_DD_PCT>={RED_DD_PCT}")
-
-    if cur_loss_streak >= RED_LOSS_STREAK:
-        reasons_red.append(f"LOSS_STREAK>={RED_LOSS_STREAK}")
-
-    if sum_r <= RED_R_SUM:
-        reasons_red.append(f"SUM_R<={RED_R_SUM}")
-
-    if total_trades >= 5 and winrate < RED_WINRATE_MIN:
-        reasons_red.append(f"WINRATE<{RED_WINRATE_MIN}")
-
-    if reasons_red:
-        return {
-            "gate_level": "RED",
-            "allow_new_entries": False,
-            "risk_multiplier": 0.0,
-            "reasons": reasons_red
-        }
-
-    if dd_pct >= YELLOW_DD_PCT:
-        reasons_yellow.append(f"MAX_DD_PCT>={YELLOW_DD_PCT}")
-
-    if cur_loss_streak >= YELLOW_LOSS_STREAK:
-        reasons_yellow.append(f"LOSS_STREAK>={YELLOW_LOSS_STREAK}")
-
-    if sum_r <= YELLOW_R_SUM:
-        reasons_yellow.append(f"SUM_R<={YELLOW_R_SUM}")
-
-    if total_trades >= 5 and winrate < YELLOW_WINRATE_MIN:
-        reasons_yellow.append(f"WINRATE<{YELLOW_WINRATE_MIN}")
-
-    if reasons_yellow:
-        return {
-            "gate_level": "YELLOW",
-            "allow_new_entries": True,
-            "risk_multiplier": 0.5,
-            "reasons": reasons_yellow
-        }
-
-    return {
-        "gate_level": "GREEN",
-        "allow_new_entries": True,
-        "risk_multiplier": 1.0,
-        "reasons": ["NORMAL"]
-    }
-
-
-# -------------------------------------------------------------------
 # CONTROLS + GATES
 # -------------------------------------------------------------------
 @app.get("/controls/effective")
@@ -971,7 +1054,7 @@ def gate_auto(
     lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
     limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    rows = get_deals_filtered(
+    return compute_gate_auto(
         symbol=symbol,
         account=account,
         magic=magic,
@@ -979,62 +1062,22 @@ def gate_auto(
         limit_trades=limit_trades
     )
 
-    kpis = summarize_kpis(rows)
-    gate = auto_gate_from_kpis(kpis)
-
-    return {
-        "ok": True,
-        "filters": {
-            "symbol": symbol.upper() if symbol else None,
-            "account": account,
-            "magic": magic,
-            "lookback_days": lookback_days,
-            "limit_trades": limit_trades,
-        },
-        "kpis": kpis,
-        "gate": gate
-    }
-
 
 @app.get("/status/gate_combo")
 def gate_combo(
     symbol: Optional[str] = Query(default=None),
     account: Optional[str] = Query(default=None),
     magic: Optional[str] = Query(default=None),
+    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
+    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
 ):
-    controls = get_runtime_controls(symbol)
-    auto_payload = gate_auto(symbol=symbol, account=account, magic=magic)
-    auto_gate = auto_payload["gate"]
-
-    paused = bool(controls["paused"])
-    controls_allow = bool(controls["allow_new_entries"])
-    auto_allow = bool(auto_gate["allow_new_entries"])
-
-    allow_new_entries = (not paused) and controls_allow and auto_allow
-    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
-
-    gate_level = auto_gate["gate_level"]
-    if paused:
-        gate_level = "RED"
-
-    reasons = []
-    if paused:
-        reasons.append("PAUSED")
-    if not controls_allow:
-        reasons.append("CONTROL_BLOCK")
-    reasons.extend(auto_gate.get("reasons", []))
-
-    return {
-        "ok": True,
-        "symbol": symbol.upper() if symbol else None,
-        "gate_level": gate_level,
-        "allow_new_entries": allow_new_entries,
-        "risk_multiplier": round(final_risk_multiplier, 4),
-        "paused": paused,
-        "controls": controls,
-        "auto_gate": auto_gate,
-        "reasons": reasons
-    }
+    return compute_gate_combo(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
 
 
 # -------------------------------------------------------------------
@@ -1088,7 +1131,13 @@ def system_overview(
     )
 
     kpis = summarize_kpis(rows)
-    gate = gate_combo(symbol=symbol, account=account, magic=magic)
+    gate = compute_gate_combo(
+        symbol=symbol,
+        account=account,
+        magic=magic,
+        lookback_days=lookback_days,
+        limit_trades=limit_trades
+    )
 
     heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
     try:
