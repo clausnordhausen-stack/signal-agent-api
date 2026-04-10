@@ -1,16 +1,18 @@
-from fastapi import FastAPI, HTTPException, Query, Depends, status, Header
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.security import OAuth2PasswordBearer
-from pydantic import BaseModel
-from datetime import datetime, timezone, timedelta
-from typing import Optional, Any, Dict, List
-from jose import jwt, JWTError
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
+
+import json
 import os
 import sqlite3
-import threading
-import json
 
-app = FastAPI(title="Signal Agent API", version="6.1.0")
+from fastapi import Depends, FastAPI, Header, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import RedirectResponse
+from fastapi.security import OAuth2PasswordBearer
+from jose import JWTError, jwt
+from pydantic import BaseModel, EmailStr
+
+app = FastAPI(title="Signal Agent API", version="7.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -20,263 +22,342 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# -------------------------------------------------------------------
-# CONFIG
-# -------------------------------------------------------------------
 SECRET_KEY = os.getenv("SECRET_KEY", "supersecret123")
-DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
-DEFAULT_GATE_LEVEL = os.getenv("DEFAULT_GATE_LEVEL", "GREEN").upper()
-HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
-
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-APP_USERNAME = os.getenv("APP_USERNAME", "admin")
-APP_PASSWORD = os.getenv("APP_PASSWORD", "123456")
+TV_API_KEY = os.getenv("TV_API_KEY", "supersecret123")
+HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
+DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
-# Optional app token protection for dashboard routes
-APP_TOKEN = os.getenv("APP_TOKEN", "").strip()
-APP_TOKEN_HEADER = os.getenv("APP_TOKEN_HEADER", "X-APP-TOKEN").strip() or "X-APP-TOKEN"
-
-# TV/API key
-TV_API_KEY = os.getenv("TV_API_KEY", SECRET_KEY)
-
-# Controls / manual overrides
-DEFAULT_ALLOW_NEW_ENTRIES = os.getenv("DEFAULT_ALLOW_NEW_ENTRIES", "true").lower() == "true"
-DEFAULT_RISK_MULTIPLIER = float(os.getenv("DEFAULT_RISK_MULTIPLIER", "1.0"))
-DEFAULT_PAUSED = os.getenv("DEFAULT_PAUSED", "false").lower() == "true"
-
-# KPI CONFIG (Phase 6)
-DEFAULT_KPI_LOOKBACK_DAYS = int(os.getenv("DEFAULT_KPI_LOOKBACK_DAYS", "7"))
-DEFAULT_KPI_LIMIT_TRADES = int(os.getenv("DEFAULT_KPI_LIMIT_TRADES", "50"))
-
-AUTO_GATE_ENABLED = os.getenv("AUTO_GATE_ENABLED", "true").lower() == "true"
-
-YELLOW_DD_PCT = float(os.getenv("YELLOW_DD_PCT", "3.0"))
-RED_DD_PCT = float(os.getenv("RED_DD_PCT", "6.0"))
-
-YELLOW_LOSS_STREAK = int(os.getenv("YELLOW_LOSS_STREAK", "3"))
-RED_LOSS_STREAK = int(os.getenv("RED_LOSS_STREAK", "5"))
-
-YELLOW_R_SUM = float(os.getenv("YELLOW_R_SUM", "-2.0"))
-RED_R_SUM = float(os.getenv("RED_R_SUM", "-4.0"))
-
-YELLOW_WINRATE_MIN = float(os.getenv("YELLOW_WINRATE_MIN", "35.0"))
-RED_WINRATE_MIN = float(os.getenv("RED_WINRATE_MIN", "25.0"))
-
-DB_LOCK = threading.Lock()
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
-# -------------------------------------------------------------------
-# HELPERS
-# -------------------------------------------------------------------
-def now_utc() -> datetime:
-    return datetime.now(timezone.utc)
+SEED_USERS: Dict[str, Dict[str, Any]] = {
+    "test@test.com": {
+        "password": "123456",
+        "role": "customer",
+        "customer_id": 1,
+        "display_name": "Test Customer",
+        "access_status": "active",
+        "trading_status": "enabled",
+        "subscription_status": "active",
+    },
+    "admin@claus.digital": {
+        "password": "123456",
+        "role": "master",
+        "customer_id": None,
+        "display_name": "Master Admin",
+        "access_status": "active",
+        "trading_status": "enabled",
+        "subscription_status": "active",
+    },
+}
+
+SEED_CUSTOMERS: Dict[int, Dict[str, Any]] = {
+    1: {
+        "id": 1,
+        "display_name": "Test Customer",
+        "access_start_at": None,
+        "access_end_at": None,
+        "access_status": "active",
+        "trading_status": "enabled",
+        "subscription_status": "active",
+        "grace_until": None,
+    },
+}
+
+SEED_EXPERT_ADVISORS: List[Dict[str, Any]] = [
+    {
+        "id": 1,
+        "ea_name": "Gold Core EA",
+        "ea_code": "gold_core_ea",
+        "version": "1.0.0",
+        "default_symbol": "XAUUSD",
+        "default_magic": "61001",
+        "download_url": "",
+        "file_name": "gold_core_ea.ex5",
+        "is_active": True,
+    },
+    {
+        "id": 2,
+        "ea_name": "BTC Core EA",
+        "ea_code": "btc_core_ea",
+        "version": "1.0.0",
+        "default_symbol": "BTCUSD",
+        "default_magic": "61002",
+        "download_url": "",
+        "file_name": "btc_core_ea.ex5",
+        "is_active": True,
+    },
+]
+
+SEED_CUSTOMER_ACCOUNTS: Dict[str, List[Dict[str, Any]]] = {
+    "test@test.com": [
+        {
+            "id": 1,
+            "account_number": "10001",
+            "broker": "IC Markets",
+            "broker_name": "IC Markets",
+            "account_label": "IC Markets • 10001",
+            "is_active": True,
+        },
+        {
+            "id": 2,
+            "account_number": "10002",
+            "broker": "FTMO",
+            "broker_name": "FTMO",
+            "account_label": "FTMO • 10002",
+            "is_active": True,
+        },
+    ],
+    "admin@claus.digital": [
+        {
+            "id": 10,
+            "account_number": "90001",
+            "broker": "Master View",
+            "broker_name": "Master View",
+            "account_label": "Master View • 90001",
+            "is_active": True,
+        },
+    ],
+}
+
+SEED_ACCOUNT_STRATEGIES: Dict[int, List[Dict[str, Any]]] = {
+    1: [
+        {
+            "id": 1,
+            "account_id": 1,
+            "symbol": "XAUUSD",
+            "name": "Gold Core",
+            "strategy_name": "Gold Core",
+            "strategy_code": "xau_core",
+            "magic": "61001",
+            "risk_tier": "balanced",
+            "is_enabled": True,
+            "ea_id": 1,
+        },
+        {
+            "id": 2,
+            "account_id": 1,
+            "symbol": "BTCUSD",
+            "name": "BTC Core",
+            "strategy_name": "BTC Core",
+            "strategy_code": "btc_core",
+            "magic": "61002",
+            "risk_tier": "balanced",
+            "is_enabled": True,
+            "ea_id": 2,
+        },
+    ],
+    2: [
+        {
+            "id": 3,
+            "account_id": 2,
+            "symbol": "XAUUSD",
+            "name": "Gold Core",
+            "strategy_name": "Gold Core",
+            "strategy_code": "xau_core",
+            "magic": "61001",
+            "risk_tier": "balanced",
+            "is_enabled": True,
+            "ea_id": 1,
+        },
+        {
+            "id": 4,
+            "account_id": 2,
+            "symbol": "BTCUSD",
+            "name": "BTC Core",
+            "strategy_name": "BTC Core",
+            "strategy_code": "btc_core",
+            "magic": "61002",
+            "risk_tier": "balanced",
+            "is_enabled": True,
+            "ea_id": 2,
+        },
+    ],
+    10: [
+        {
+            "id": 5,
+            "account_id": 10,
+            "symbol": "XAUUSD",
+            "name": "Gold Master",
+            "strategy_name": "Gold Master",
+            "strategy_code": "xau_core",
+            "magic": "777",
+            "risk_tier": "balanced",
+            "is_enabled": True,
+            "ea_id": 1,
+        },
+        {
+            "id": 6,
+            "account_id": 10,
+            "symbol": "BTCUSD",
+            "name": "BTC Master",
+            "strategy_name": "BTC Master",
+            "strategy_code": "btc_core",
+            "magic": "62001",
+            "risk_tier": "balanced",
+            "is_enabled": True,
+            "ea_id": 2,
+        },
+    ],
+}
+
+SEED_CUSTOMER_SETUP: Dict[str, Dict[int, Dict[str, Dict[str, Any]]]] = {
+    "test@test.com": {
+        1: {
+            "XAUUSD": {"enabled": True, "risk_tier": "balanced"},
+            "BTCUSD": {"enabled": True, "risk_tier": "balanced"},
+        },
+        2: {
+            "XAUUSD": {"enabled": True, "risk_tier": "balanced"},
+            "BTCUSD": {"enabled": True, "risk_tier": "balanced"},
+        },
+    },
+    "admin@claus.digital": {
+        10: {
+            "XAUUSD": {"enabled": True, "risk_tier": "balanced"},
+            "BTCUSD": {"enabled": True, "risk_tier": "balanced"},
+        },
+    },
+}
 
 
-def utc_iso(dt: Optional[datetime] = None) -> str:
-    if dt is None:
-        dt = now_utc()
-    return dt.astimezone(timezone.utc).isoformat()
-
-
-def parse_dt(value: Optional[str]) -> Optional[datetime]:
-    if not value:
-        return None
-    try:
-        if value.endswith("Z"):
-            value = value.replace("Z", "+00:00")
-        dt = datetime.fromisoformat(value)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def dict_factory(cursor, row):
-    d = {}
-    for idx, col in enumerate(cursor.description):
-        d[col[0]] = row[idx]
-    return d
-
-
-def get_conn():
-    conn = sqlite3.connect(DB_PATH, check_same_thread=False)
-    conn.row_factory = dict_factory
-    return conn
-
-
-def safe_float(x, default=0.0):
-    try:
-        if x is None or x == "":
-            return default
-        return float(x)
-    except Exception:
-        return default
-
-
-def safe_int(x, default=0):
-    try:
-        if x is None or x == "":
-            return default
-        return int(x)
-    except Exception:
-        return default
-
-
-def create_access_token(data: dict, expires_delta: Optional[timedelta] = None):
-    to_encode = data.copy()
-    expire = now_utc() + (expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES))
-    to_encode.update({"exp": expire})
-    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
-
-
-def decode_token(token: str) -> dict:
-    try:
-        return jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
-    except JWTError:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
-
-
-def get_current_user(token: str = Depends(oauth2_scheme)):
-    payload = decode_token(token)
-    username = payload.get("sub")
-    if not username:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token payload"
-        )
-    return {"username": username}
-
-
-def app_token_guard(x_app_token: Optional[str] = Header(default=None, alias=APP_TOKEN_HEADER)):
-    if APP_TOKEN:
-        if x_app_token != APP_TOKEN:
-            raise HTTPException(status_code=401, detail="Invalid app token")
-    return True
-
-
-def get_runtime_controls(symbol: Optional[str] = None) -> Dict[str, Any]:
-    return {
-        "paused": DEFAULT_PAUSED,
-        "allow_new_entries": DEFAULT_ALLOW_NEW_ENTRIES,
-        "risk_multiplier": DEFAULT_RISK_MULTIPLIER,
-        "symbol": symbol.upper() if symbol else None,
-        "source": "default_env"
-    }
-
-
-# -------------------------------------------------------------------
-# DB INIT
-# -------------------------------------------------------------------
-def init_db():
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS signals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            symbol TEXT NOT NULL,
-            side TEXT,
-            payload_json TEXT,
-            created_utc TEXT NOT NULL,
-            updated_utc TEXT NOT NULL,
-            status TEXT NOT NULL DEFAULT 'pending'
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS signal_acks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            signal_id INTEGER NOT NULL,
-            symbol TEXT NOT NULL,
-            account TEXT NOT NULL,
-            magic TEXT,
-            ack_utc TEXT NOT NULL,
-            UNIQUE(signal_id, account, magic)
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS heartbeats (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account TEXT,
-            magic TEXT,
-            symbol TEXT,
-            ea_name TEXT,
-            version TEXT,
-            last_seen_utc TEXT NOT NULL,
-            status TEXT,
-            comment TEXT
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS deals (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account TEXT,
-            magic TEXT,
-            symbol TEXT,
-            side TEXT,
-            ticket TEXT,
-            volume REAL,
-            entry_price REAL,
-            exit_price REAL,
-            sl REAL,
-            tp REAL,
-            pnl REAL,
-            pnl_currency TEXT,
-            commission REAL,
-            swap REAL,
-            risk_amount REAL,
-            r_multiple REAL,
-            strategy TEXT,
-            deal_time_utc TEXT NOT NULL,
-            created_utc TEXT NOT NULL
-        )
-        """)
-
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS risks (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            account TEXT,
-            magic TEXT,
-            symbol TEXT,
-            event_type TEXT,
-            level TEXT,
-            message TEXT,
-            value REAL,
-            created_utc TEXT NOT NULL
-        )
-        """)
-
-        conn.commit()
-        conn.close()
-
-
-init_db()
-
-
-# -------------------------------------------------------------------
-# MODELS
-# -------------------------------------------------------------------
 class LoginRequest(BaseModel):
-    username: str
+    email: EmailStr
     password: str
 
 
-class TokenResponse(BaseModel):
+class LoginResponse(BaseModel):
     access_token: str
     token_type: str
 
 
-class UserResponse(BaseModel):
-    username: str
+class StrategySetupIn(BaseModel):
+    enabled: bool
+    risk_tier: str
+
+
+class CustomerAccountCreate(BaseModel):
+    broker_name: str
+    account_number: str
+    account_label: str
+    is_active: bool = True
+
+
+class CustomerAccountUpdate(BaseModel):
+    broker_name: str
+    account_number: str
+    account_label: str
+    is_active: bool = True
+
+
+class CustomerStrategyCreate(BaseModel):
+    account_id: Optional[int] = None
+    symbol: str
+    strategy_code: str
+    strategy_name: str
+    magic: int
+    risk_tier: str = "balanced"
+    is_enabled: bool = True
+    ea_id: Optional[int] = None
+
+
+class CustomerStrategyUpdate(BaseModel):
+    account_id: Optional[int] = None
+    symbol: str
+    strategy_code: str
+    strategy_name: str
+    magic: int
+    risk_tier: str = "balanced"
+    is_enabled: bool = True
+    ea_id: Optional[int] = None
+
+
+class MasterCustomerCreate(BaseModel):
+    display_name: str
+    access_start_at: Optional[str] = None
+    access_end_at: Optional[str] = None
+    access_status: str = "active"
+    trading_status: str = "enabled"
+    subscription_status: str = "active"
+    grace_until: Optional[str] = None
+
+
+class MasterCustomerUpdate(BaseModel):
+    display_name: str
+    access_start_at: Optional[str] = None
+    access_end_at: Optional[str] = None
+    access_status: str = "active"
+    trading_status: str = "enabled"
+    subscription_status: str = "active"
+    grace_until: Optional[str] = None
+
+
+class MasterUserCreate(BaseModel):
+    email: EmailStr
+    password: str
+    display_name: str
+    customer_id: int
+
+
+class MasterCustomerAccountCreate(BaseModel):
+    broker_name: str
+    account_number: str
+    account_label: str
+    is_active: bool = True
+
+
+class MasterCustomerAccountUpdate(BaseModel):
+    broker_name: str
+    account_number: str
+    account_label: str
+    is_active: bool = True
+
+
+class MasterCustomerStrategyCreate(BaseModel):
+    account_id: int
+    symbol: str
+    strategy_code: str
+    strategy_name: str
+    magic: int
+    risk_tier: str = "balanced"
+    is_enabled: bool = True
+    ea_id: Optional[int] = None
+
+
+class MasterCustomerStrategyUpdate(BaseModel):
+    account_id: int
+    symbol: str
+    strategy_code: str
+    strategy_name: str
+    magic: int
+    risk_tier: str = "balanced"
+    is_enabled: bool = True
+    ea_id: Optional[int] = None
+
+
+class ExpertAdvisorCreate(BaseModel):
+    ea_name: str
+    ea_code: str
+    version: Optional[str] = None
+    default_symbol: Optional[str] = None
+    default_magic: Optional[int] = None
+    download_url: Optional[str] = None
+    file_name: Optional[str] = None
+    is_active: bool = True
+
+
+class ExpertAdvisorUpdate(BaseModel):
+    ea_name: str
+    ea_code: str
+    version: Optional[str] = None
+    default_symbol: Optional[str] = None
+    default_magic: Optional[int] = None
+    download_url: Optional[str] = None
+    file_name: Optional[str] = None
+    is_active: bool = True
 
 
 class TVSignalIn(BaseModel):
@@ -284,8 +365,7 @@ class TVSignalIn(BaseModel):
     symbol: str
     side: Optional[str] = None
     action: Optional[str] = None
-    id: Optional[str] = None
-    ts: Optional[str] = None
+    score: Optional[float] = 1.0
     payload: Optional[Dict[str, Any]] = None
 
 
@@ -294,6 +374,7 @@ class AckIn(BaseModel):
     updated_utc: str
     account: str
     magic: Optional[str] = None
+    ticket: Optional[str] = None
 
 
 class HeartbeatPing(BaseModel):
@@ -305,11 +386,12 @@ class HeartbeatPing(BaseModel):
     version: Optional[str] = None
     status: Optional[str] = "alive"
     comment: Optional[str] = None
+    owner_name: Optional[str] = None
 
 
 class DealIn(BaseModel):
-    account: Optional[str] = None
-    magic: Optional[str] = None
+    account: str
+    magic: str
     symbol: str
     side: Optional[str] = None
     ticket: Optional[str] = None
@@ -318,150 +400,1263 @@ class DealIn(BaseModel):
     exit_price: Optional[float] = None
     sl: Optional[float] = None
     tp: Optional[float] = None
-    pnl: Optional[float] = None
-    pnl_currency: Optional[str] = "USD"
+    pnl: Optional[float] = 0.0
     commission: Optional[float] = 0.0
     swap: Optional[float] = 0.0
-    risk_amount: Optional[float] = None
-    r_multiple: Optional[float] = None
-    strategy: Optional[str] = None
+    r_multiple: Optional[float] = 0.0
+    strategy_code: Optional[str] = None
     deal_time_utc: Optional[str] = None
 
 
 class RiskIn(BaseModel):
-    account: Optional[str] = None
-    magic: Optional[str] = None
+    account: str
+    magic: str
     symbol: str
-    event_type: str
-    level: Optional[str] = None
-    message: Optional[str] = None
-    value: Optional[float] = None
+    risk_level: str = "GREEN"
+    allow_new_entries: bool = True
+    daily_pnl: float = 0.0
+    daily_r: float = 0.0
+    daily_trades: int = 0
+    reasons: Optional[List[str]] = None
+    limits: Optional[Dict[str, Any]] = None
 
 
-# -------------------------------------------------------------------
-# INTERNAL CORE HELPERS
-# -------------------------------------------------------------------
-def build_heartbeat_status(symbol: Optional[str] = None) -> Dict[str, Any]:
-    symbol_norm = symbol.strip().upper() if symbol else None
-    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
+def get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DB_PATH)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
 
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
 
-        if symbol_norm:
-            cur.execute("""
-            SELECT * FROM heartbeats
+def row_to_dict(row: Optional[sqlite3.Row]) -> Optional[Dict[str, Any]]:
+    return dict(row) if row is not None else None
+
+
+def rows_to_dicts(rows: List[sqlite3.Row]) -> List[Dict[str, Any]]:
+    return [dict(r) for r in rows]
+
+
+def now_utc() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def now_utc_iso() -> str:
+    return now_utc().isoformat()
+
+
+def parse_dt(value: Optional[str]) -> Optional[datetime]:
+    if not value:
+        return None
+    try:
+        dt = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        if value is None or value == "":
+            return default
+        return float(value)
+    except Exception:
+        return default
+
+
+def safe_int(value: Any, default: int = 0) -> int:
+    try:
+        if value is None or value == "":
+            return default
+        return int(value)
+    except Exception:
+        return default
+
+
+def build_public_ea_download_url(ea_id: int) -> Optional[str]:
+    if not PUBLIC_BASE_URL:
+        return None
+    return f"{PUBLIC_BASE_URL}/public/eas/{ea_id}/download"
+
+
+def init_db() -> None:
+    with get_db() as conn:
+        conn.executescript(
+            '''
+            CREATE TABLE IF NOT EXISTS customers (
+                id INTEGER PRIMARY KEY,
+                display_name TEXT NOT NULL,
+                access_start_at TEXT,
+                access_end_at TEXT,
+                access_status TEXT NOT NULL DEFAULT 'active',
+                trading_status TEXT NOT NULL DEFAULT 'enabled',
+                subscription_status TEXT NOT NULL DEFAULT 'active',
+                grace_until TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS users (
+                email TEXT PRIMARY KEY,
+                password TEXT NOT NULL,
+                role TEXT NOT NULL,
+                customer_id INTEGER,
+                display_name TEXT NOT NULL,
+                access_status TEXT NOT NULL DEFAULT 'active',
+                trading_status TEXT NOT NULL DEFAULT 'enabled',
+                subscription_status TEXT NOT NULL DEFAULT 'active',
+                FOREIGN KEY(customer_id) REFERENCES customers(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS expert_advisors (
+                id INTEGER PRIMARY KEY,
+                ea_name TEXT NOT NULL,
+                ea_code TEXT NOT NULL UNIQUE,
+                version TEXT,
+                default_symbol TEXT,
+                default_magic TEXT,
+                download_url TEXT,
+                file_name TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1
+            );
+
+            CREATE TABLE IF NOT EXISTS customer_accounts (
+                id INTEGER PRIMARY KEY,
+                user_email TEXT NOT NULL,
+                account_number TEXT NOT NULL,
+                broker TEXT,
+                broker_name TEXT,
+                account_label TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                UNIQUE(user_email, account_number),
+                FOREIGN KEY(user_email) REFERENCES users(email) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS customer_strategies (
+                id INTEGER PRIMARY KEY,
+                account_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                name TEXT,
+                strategy_name TEXT NOT NULL,
+                strategy_code TEXT NOT NULL,
+                magic TEXT NOT NULL,
+                risk_tier TEXT NOT NULL DEFAULT 'balanced',
+                is_enabled INTEGER NOT NULL DEFAULT 1,
+                ea_id INTEGER,
+                UNIQUE(account_id, symbol, magic),
+                FOREIGN KEY(account_id) REFERENCES customer_accounts(id) ON DELETE CASCADE,
+                FOREIGN KEY(ea_id) REFERENCES expert_advisors(id)
+            );
+
+            CREATE TABLE IF NOT EXISTS customer_strategy_setup (
+                user_email TEXT NOT NULL,
+                account_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                risk_tier TEXT NOT NULL DEFAULT 'balanced',
+                PRIMARY KEY(user_email, account_id, symbol),
+                FOREIGN KEY(user_email) REFERENCES users(email) ON DELETE CASCADE,
+                FOREIGN KEY(account_id) REFERENCES customer_accounts(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS audit_logs (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                created_utc TEXT NOT NULL,
+                actor_email TEXT NOT NULL,
+                action_type TEXT NOT NULL,
+                message TEXT NOT NULL,
+                target_customer_id INTEGER,
+                target_user_email TEXT,
+                target_account_id INTEGER,
+                target_strategy_id INTEGER
+            );
+
+            CREATE TABLE IF NOT EXISTS signals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                symbol TEXT NOT NULL,
+                side TEXT NOT NULL,
+                score REAL,
+                payload_json TEXT,
+                created_utc TEXT NOT NULL,
+                updated_utc TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'pending'
+            );
+
+            CREATE TABLE IF NOT EXISTS signal_acks (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                signal_id INTEGER NOT NULL,
+                symbol TEXT NOT NULL,
+                account TEXT NOT NULL,
+                magic TEXT NOT NULL,
+                ack_utc TEXT NOT NULL,
+                ticket TEXT,
+                UNIQUE(signal_id, account, magic)
+            );
+
+            CREATE TABLE IF NOT EXISTS heartbeats (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL,
+                magic TEXT,
+                symbol TEXT NOT NULL,
+                ea_name TEXT,
+                version TEXT,
+                last_seen_utc TEXT NOT NULL,
+                status TEXT,
+                comment TEXT,
+                owner_name TEXT
+            );
+
+            CREATE TABLE IF NOT EXISTS deals (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL,
+                magic TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                side TEXT,
+                ticket TEXT,
+                volume REAL,
+                entry_price REAL,
+                exit_price REAL,
+                sl REAL,
+                tp REAL,
+                pnl REAL,
+                commission REAL,
+                swap REAL,
+                r_multiple REAL,
+                strategy_code TEXT,
+                deal_time_utc TEXT NOT NULL,
+                created_utc TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS risk_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL,
+                magic TEXT NOT NULL,
+                symbol TEXT NOT NULL,
+                risk_level TEXT NOT NULL,
+                allow_new_entries INTEGER NOT NULL DEFAULT 1,
+                daily_pnl REAL NOT NULL DEFAULT 0,
+                daily_r REAL NOT NULL DEFAULT 0,
+                daily_trades INTEGER NOT NULL DEFAULT 0,
+                reasons_json TEXT,
+                limits_json TEXT,
+                created_utc TEXT NOT NULL
+            );
+            '''
+        )
+
+
+def run_db_migrations() -> None:
+    with get_db() as conn:
+        ea_cols = [r["name"] for r in conn.execute("PRAGMA table_info(expert_advisors)").fetchall()]
+        if "download_url" not in ea_cols:
+            conn.execute("ALTER TABLE expert_advisors ADD COLUMN download_url TEXT")
+        if "file_name" not in ea_cols:
+            conn.execute("ALTER TABLE expert_advisors ADD COLUMN file_name TEXT")
+
+        strategy_cols = [r["name"] for r in conn.execute("PRAGMA table_info(customer_strategies)").fetchall()]
+        if "ea_id" not in strategy_cols:
+            conn.execute("ALTER TABLE customer_strategies ADD COLUMN ea_id INTEGER")
+
+
+def seed_db_if_empty() -> None:
+    with get_db() as conn:
+        existing = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
+        if existing > 0:
+            return
+
+        for customer in SEED_CUSTOMERS.values():
+            conn.execute(
+                '''
+                INSERT INTO customers (
+                    id, display_name, access_start_at, access_end_at,
+                    access_status, trading_status, subscription_status, grace_until
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    customer["id"],
+                    customer["display_name"],
+                    customer.get("access_start_at"),
+                    customer.get("access_end_at"),
+                    customer.get("access_status", "active"),
+                    customer.get("trading_status", "enabled"),
+                    customer.get("subscription_status", "active"),
+                    customer.get("grace_until"),
+                ),
+            )
+
+        for email, user in SEED_USERS.items():
+            conn.execute(
+                '''
+                INSERT INTO users (
+                    email, password, role, customer_id, display_name,
+                    access_status, trading_status, subscription_status
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    email,
+                    user["password"],
+                    user["role"],
+                    user.get("customer_id"),
+                    user.get("display_name", email),
+                    user.get("access_status", "active"),
+                    user.get("trading_status", "enabled"),
+                    user.get("subscription_status", "active"),
+                ),
+            )
+
+        for ea in SEED_EXPERT_ADVISORS:
+            conn.execute(
+                '''
+                INSERT INTO expert_advisors (
+                    id, ea_name, ea_code, version, default_symbol, default_magic,
+                    download_url, file_name, is_active
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ''',
+                (
+                    ea["id"],
+                    ea["ea_name"],
+                    ea["ea_code"],
+                    ea.get("version"),
+                    ea.get("default_symbol"),
+                    ea.get("default_magic"),
+                    ea.get("download_url"),
+                    ea.get("file_name"),
+                    1 if ea.get("is_active", True) else 0,
+                ),
+            )
+
+        for email, accounts in SEED_CUSTOMER_ACCOUNTS.items():
+            for account in accounts:
+                conn.execute(
+                    '''
+                    INSERT INTO customer_accounts (
+                        id, user_email, account_number, broker, broker_name,
+                        account_label, is_active
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        account["id"],
+                        email,
+                        account["account_number"],
+                        account.get("broker"),
+                        account.get("broker_name"),
+                        account.get("account_label"),
+                        1 if account.get("is_active", True) else 0,
+                    ),
+                )
+
+        for account_id, strategies in SEED_ACCOUNT_STRATEGIES.items():
+            for strategy in strategies:
+                conn.execute(
+                    '''
+                    INSERT INTO customer_strategies (
+                        id, account_id, symbol, name, strategy_name,
+                        strategy_code, magic, risk_tier, is_enabled, ea_id
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ''',
+                    (
+                        strategy["id"],
+                        account_id,
+                        strategy["symbol"].upper(),
+                        strategy.get("name"),
+                        strategy.get("strategy_name") or strategy.get("name"),
+                        strategy["strategy_code"],
+                        str(strategy["magic"]),
+                        strategy.get("risk_tier", "balanced"),
+                        1 if strategy.get("is_enabled", True) else 0,
+                        strategy.get("ea_id"),
+                    ),
+                )
+
+        for email, account_map in SEED_CUSTOMER_SETUP.items():
+            for account_id, symbol_map in account_map.items():
+                for symbol, setup in symbol_map.items():
+                    conn.execute(
+                        '''
+                        INSERT INTO customer_strategy_setup (
+                            user_email, account_id, symbol, enabled, risk_tier
+                        ) VALUES (?, ?, ?, ?, ?)
+                        ''',
+                        (
+                            email,
+                            account_id,
+                            symbol.upper(),
+                            1 if setup.get("enabled", True) else 0,
+                            setup.get("risk_tier", "balanced"),
+                        ),
+                    )
+
+
+def force_seed_defaults() -> Dict[str, Any]:
+    init_db()
+    run_db_migrations()
+    with get_db() as conn:
+        conn.execute("DELETE FROM customer_strategy_setup")
+        conn.execute("DELETE FROM customer_strategies")
+        conn.execute("DELETE FROM customer_accounts")
+        conn.execute("DELETE FROM expert_advisors")
+        conn.execute("DELETE FROM users")
+        conn.execute("DELETE FROM customers")
+    seed_db_if_empty()
+    return {
+        "ok": True,
+        "message": "Defaults seeded",
+        "db_path": DB_PATH,
+        "available_logins": [
+            {"email": "admin@claus.digital", "password": "123456", "role": "master"},
+            {"email": "test@test.com", "password": "123456", "role": "customer"},
+        ],
+    }
+
+
+@app.on_event("startup")
+def startup_event() -> None:
+    init_db()
+    run_db_migrations()
+    seed_db_if_empty()
+
+
+def create_token(email: str, role: str) -> str:
+    expire = now_utc() + timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    payload = {"sub": email, "role": role, "exp": expire}
+    return jwt.encode(payload, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def db_get_user(email: str) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM users WHERE email = ?", (email,)).fetchone()
+    return row_to_dict(row)
+
+
+def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        email = payload.get("sub")
+        if not email:
+            raise HTTPException(status_code=401, detail="Invalid token")
+        user = db_get_user(email)
+        if not user:
+            raise HTTPException(status_code=401, detail="User not found")
+        return {
+            "email": user["email"],
+            "role": user["role"],
+            "customer_id": user.get("customer_id"),
+            "display_name": user.get("display_name") or user["email"],
+            "access_status": user.get("access_status", "active"),
+            "trading_status": user.get("trading_status", "enabled"),
+            "subscription_status": user.get("subscription_status", "active"),
+        }
+    except JWTError as exc:
+        raise HTTPException(status_code=401, detail="Invalid token") from exc
+
+
+def require_customer(current_user: Dict[str, Any]) -> None:
+    if current_user["role"] != "customer":
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+
+def require_master(current_user: Dict[str, Any]) -> None:
+    if current_user["role"] != "master":
+        raise HTTPException(status_code=403, detail="Not allowed")
+
+
+def normalize_risk_tier(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("conservative", "balanced", "dynamic", "aggressive"):
+        raise HTTPException(status_code=422, detail="Invalid risk_tier")
+    return normalized
+
+
+def normalize_access_status(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("active", "disabled", "expired", "paused"):
+        raise HTTPException(status_code=422, detail="Invalid access_status")
+    return normalized
+
+
+def normalize_trading_status(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("enabled", "disabled", "paused"):
+        raise HTTPException(status_code=422, detail="Invalid trading_status")
+    return normalized
+
+
+def normalize_subscription_status(value: str) -> str:
+    normalized = value.strip().lower()
+    if normalized not in ("active", "trial", "expired", "cancelled", "grace"):
+        raise HTTPException(status_code=422, detail="Invalid subscription_status")
+    return normalized
+
+
+def normalize_side(value: Optional[str]) -> str:
+    text = (value or "").strip().upper()
+    if text == "LONG":
+        return "BUY"
+    if text == "SHORT":
+        return "SELL"
+    return text
+
+
+def next_id(table_name: str) -> int:
+    with get_db() as conn:
+        row = conn.execute(f"SELECT COALESCE(MAX(id), 0) + 1 AS next_id FROM {table_name}").fetchone()
+    return int(row["next_id"])
+
+
+def next_customer_id() -> int:
+    return next_id("customers")
+
+
+def next_account_id() -> int:
+    return next_id("customer_accounts")
+
+
+def next_strategy_id() -> int:
+    return next_id("customer_strategies")
+
+
+def next_ea_id() -> int:
+    return next_id("expert_advisors")
+
+
+def write_audit_log(
+    actor_email: str,
+    action_type: str,
+    message: str,
+    target_customer_id: Optional[int] = None,
+    target_user_email: Optional[str] = None,
+    target_account_id: Optional[int] = None,
+    target_strategy_id: Optional[int] = None,
+) -> None:
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO audit_logs (
+                created_utc, actor_email, action_type, message,
+                target_customer_id, target_user_email, target_account_id, target_strategy_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                now_utc_iso(),
+                actor_email,
+                action_type,
+                message,
+                target_customer_id,
+                target_user_email,
+                target_account_id,
+                target_strategy_id,
+            ),
+        )
+
+
+def find_customer(customer_id: int) -> Dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM customers WHERE id = ?", (customer_id,)).fetchone()
+    customer = row_to_dict(row)
+    if not customer:
+        raise HTTPException(status_code=404, detail="Customer not found")
+    return customer
+
+
+def get_customer_user_emails(customer_id: int) -> List[str]:
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT email FROM users WHERE customer_id = ? AND role = 'customer' ORDER BY email",
+            (customer_id,),
+        ).fetchall()
+    return [row["email"] for row in rows]
+
+
+def get_primary_customer_email(customer_id: int) -> Optional[str]:
+    emails = get_customer_user_emails(customer_id)
+    return emails[0] if emails else None
+
+
+def require_customer_owner_email(customer_id: int) -> str:
+    email = get_primary_customer_email(customer_id)
+    if not email:
+        raise HTTPException(status_code=400, detail="Customer has no customer-user login yet")
+    return email
+
+
+def sync_customer_status_to_users(customer_id: int) -> None:
+    customer = find_customer(customer_id)
+    with get_db() as conn:
+        conn.execute(
+            '''
+            UPDATE users
+            SET access_status = ?, trading_status = ?, subscription_status = ?
+            WHERE customer_id = ?
+            ''',
+            (
+                customer.get("access_status", "active"),
+                customer.get("trading_status", "enabled"),
+                customer.get("subscription_status", "active"),
+                customer_id,
+            ),
+        )
+
+
+def format_customer_payload(customer: Dict[str, Any]) -> Dict[str, Any]:
+    customer_id = int(customer["id"])
+    user_emails = get_customer_user_emails(customer_id)
+    return {
+        "id": customer_id,
+        "display_name": customer["display_name"],
+        "access_start_at": customer.get("access_start_at"),
+        "access_end_at": customer.get("access_end_at"),
+        "access_status": customer.get("access_status", "active"),
+        "trading_status": customer.get("trading_status", "enabled"),
+        "subscription_status": customer.get("subscription_status", "active"),
+        "grace_until": customer.get("grace_until"),
+        "user_count": len(user_emails),
+        "user_emails": user_emails,
+    }
+
+
+def find_ea(ea_id: int) -> Dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, ea_name, ea_code, version, default_symbol, default_magic,
+                   download_url, file_name, is_active
+            FROM expert_advisors
+            WHERE id = ?
+            ''',
+            (ea_id,),
+        ).fetchone()
+    ea = row_to_dict(row)
+    if not ea:
+        raise HTTPException(status_code=404, detail="Expert advisor not found")
+    ea["is_active"] = bool(ea.get("is_active", 1))
+    return ea
+
+
+def list_eas() -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT id, ea_name, ea_code, version, default_symbol, default_magic,
+                   download_url, file_name, is_active
+            FROM expert_advisors
+            ORDER BY ea_name, id
+            '''
+        ).fetchall()
+    result = rows_to_dicts(rows)
+    for row in result:
+        row["is_active"] = bool(row.get("is_active", 1))
+    return result
+
+
+def format_ea_payload(ea: Dict[str, Any]) -> Dict[str, Any]:
+    ea_id = int(ea["id"])
+    return {
+        "id": ea_id,
+        "ea_name": ea["ea_name"],
+        "ea_code": ea["ea_code"],
+        "version": ea.get("version"),
+        "default_symbol": ea.get("default_symbol"),
+        "default_magic": str(ea.get("default_magic")) if ea.get("default_magic") is not None else None,
+        "download_url": ea.get("download_url"),
+        "file_name": ea.get("file_name"),
+        "public_download_path": f"/public/eas/{ea_id}/download",
+        "public_download_url": build_public_ea_download_url(ea_id),
+        "is_active": bool(ea.get("is_active", True)),
+    }
+
+
+def get_ea_payload_or_none(ea_id: Optional[int]) -> Optional[Dict[str, Any]]:
+    if ea_id is None:
+        return None
+    try:
+        return format_ea_payload(find_ea(int(ea_id)))
+    except HTTPException:
+        return None
+
+
+def get_user_accounts(email: str) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT id, user_email, account_number, broker, broker_name, account_label, is_active
+            FROM customer_accounts
+            WHERE user_email = ?
+            ORDER BY id
+            ''',
+            (email,),
+        ).fetchall()
+    result = rows_to_dicts(rows)
+    for row in result:
+        row["is_active"] = bool(row.get("is_active", 1))
+    return result
+
+
+def format_account_payload(account: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "id": int(account["id"]),
+        "account_number": account["account_number"],
+        "broker": account.get("broker_name") or account.get("broker"),
+        "broker_name": account.get("broker_name") or account.get("broker"),
+        "account_label": account.get("account_label") or f'{account.get("broker_name") or account.get("broker")} • {account["account_number"]}',
+        "is_active": bool(account.get("is_active", True)),
+    }
+
+
+def find_account_for_user(email: str, account_id: int) -> Dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT id, user_email, account_number, broker, broker_name, account_label, is_active
+            FROM customer_accounts
+            WHERE user_email = ? AND id = ?
+            ''',
+            (email, account_id),
+        ).fetchone()
+    account = row_to_dict(row)
+    if not account:
+        raise HTTPException(status_code=404, detail="Account not found")
+    account["is_active"] = bool(account.get("is_active", 1))
+    return account
+
+
+def ensure_account_access(email: str, account_id: int) -> None:
+    _ = find_account_for_user(email, account_id)
+
+
+def get_account_strategies(account_id: int) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT id, account_id, symbol, name, strategy_name, strategy_code,
+                   magic, risk_tier, is_enabled, ea_id
+            FROM customer_strategies
+            WHERE account_id = ?
+            ORDER BY id
+            ''',
+            (account_id,),
+        ).fetchall()
+    result = rows_to_dicts(rows)
+    for row in result:
+        row["is_enabled"] = bool(row.get("is_enabled", 1))
+    return result
+
+
+def find_strategy_for_user(email: str, strategy_id: int) -> Dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT cs.id, cs.account_id, cs.symbol, cs.name, cs.strategy_name,
+                   cs.strategy_code, cs.magic, cs.risk_tier, cs.is_enabled, cs.ea_id
+            FROM customer_strategies cs
+            JOIN customer_accounts ca ON ca.id = cs.account_id
+            WHERE ca.user_email = ? AND cs.id = ?
+            ''',
+            (email, strategy_id),
+        ).fetchone()
+    strategy = row_to_dict(row)
+    if not strategy:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+    strategy["is_enabled"] = bool(strategy.get("is_enabled", 1))
+    return strategy
+
+
+def format_strategy_payload(strategy: Dict[str, Any]) -> Dict[str, Any]:
+    ea_id = strategy.get("ea_id")
+    return {
+        "id": int(strategy["id"]),
+        "account_id": int(strategy["account_id"]),
+        "symbol": str(strategy["symbol"]).upper(),
+        "strategy_code": strategy.get("strategy_code"),
+        "strategy_name": strategy.get("strategy_name") or strategy.get("name") or str(strategy["symbol"]).upper(),
+        "name": strategy.get("strategy_name") or strategy.get("name") or str(strategy["symbol"]).upper(),
+        "magic": str(strategy.get("magic", "")),
+        "risk_tier": strategy.get("risk_tier", "balanced"),
+        "is_enabled": bool(strategy.get("is_enabled", True)),
+        "ea_id": ea_id,
+        "ea": get_ea_payload_or_none(ea_id),
+    }
+
+
+def get_strategy_setup(email: str, account_id: int, symbol: str) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT enabled, risk_tier
+            FROM customer_strategy_setup
+            WHERE user_email = ? AND account_id = ? AND symbol = ?
+            ''',
+            (email, account_id, symbol_upper),
+        ).fetchone()
+        if row:
+            return {"enabled": bool(row["enabled"]), "risk_tier": row["risk_tier"]}
+        conn.execute(
+            '''
+            INSERT INTO customer_strategy_setup (user_email, account_id, symbol, enabled, risk_tier)
+            VALUES (?, ?, ?, ?, ?)
+            ''',
+            (email, account_id, symbol_upper, 1, "balanced"),
+        )
+    return {"enabled": True, "risk_tier": "balanced"}
+
+
+def set_strategy_setup(email: str, account_id: int, symbol: str, enabled: bool, risk_tier: str) -> None:
+    symbol_upper = symbol.upper()
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO customer_strategy_setup (user_email, account_id, symbol, enabled, risk_tier)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_email, account_id, symbol)
+            DO UPDATE SET enabled = excluded.enabled, risk_tier = excluded.risk_tier
+            ''',
+            (email, account_id, symbol_upper, 1 if enabled else 0, risk_tier),
+        )
+
+
+def get_customer_accounts_with_setup(email: str) -> List[Dict[str, Any]]:
+    accounts = get_user_accounts(email)
+    result: List[Dict[str, Any]] = []
+    for account in accounts:
+        account_id = int(account["id"])
+        base_strategies = get_account_strategies(account_id)
+        symbols: List[Dict[str, Any]] = []
+        for strategy in base_strategies:
+            symbol = str(strategy["symbol"]).upper()
+            setup = get_strategy_setup(email, account_id, symbol)
+            enabled = bool(strategy.get("is_enabled", True)) and bool(setup["enabled"])
+            strategy_name = strategy.get("strategy_name") or strategy.get("name") or symbol
+            ea_id = strategy.get("ea_id")
+            symbols.append(
+                {
+                    "id": int(strategy["id"]),
+                    "account_id": account_id,
+                    "symbol": symbol,
+                    "displayName": strategy_name,
+                    "name": strategy_name,
+                    "strategy_name": strategy_name,
+                    "magic": str(strategy.get("magic", "")),
+                    "enabled": enabled,
+                    "is_enabled": bool(strategy.get("is_enabled", True)),
+                    "riskTier": setup["risk_tier"],
+                    "risk_tier": setup["risk_tier"],
+                    "strategyCode": strategy.get("strategy_code"),
+                    "strategy_code": strategy.get("strategy_code"),
+                    "sortOrder": 2 if symbol == "BTCUSD" else 1,
+                    "sort_order": 2 if symbol == "BTCUSD" else 1,
+                    "baseLot": 0.01,
+                    "base_lot": 0.01,
+                    "maxLot": 1.0,
+                    "max_lot": 1.0,
+                    "color": "#F7931A" if symbol == "BTCUSD" else "#D4AF37",
+                    "ea_id": ea_id,
+                    "ea": get_ea_payload_or_none(ea_id),
+                }
+            )
+        result.append(
+            {
+                "id": account_id,
+                "account_number": account["account_number"],
+                "label": f'{account.get("broker_name") or account.get("broker")} • {account["account_number"]}',
+                "broker": account.get("broker_name") or account.get("broker"),
+                "broker_name": account.get("broker_name") or account.get("broker"),
+                "account_label": account.get("account_label") or f'{account.get("broker_name") or account.get("broker")} • {account["account_number"]}',
+                "enabled": bool(account.get("is_active", True)),
+                "is_active": bool(account.get("is_active", True)),
+                "symbols": symbols,
+            }
+        )
+    return result
+
+
+def get_accounts_for_customer(customer_id: int) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    for email in get_customer_user_emails(customer_id):
+        for account in get_user_accounts(email):
+            items.append(format_account_payload(account))
+    items.sort(key=lambda x: int(x["id"]))
+    return items
+
+
+def get_strategies_for_customer(customer_id: int) -> List[Dict[str, Any]]:
+    items: List[Dict[str, Any]] = []
+    seen: set[int] = set()
+    for email in get_customer_user_emails(customer_id):
+        for account in get_user_accounts(email):
+            for strategy in get_account_strategies(int(account["id"])):
+                sid = int(strategy["id"])
+                if sid in seen:
+                    continue
+                seen.add(sid)
+                items.append(format_strategy_payload(strategy))
+    items.sort(key=lambda x: (int(x["account_id"]), x["symbol"], x["magic"]))
+    return items
+
+
+def find_account_for_customer(customer_id: int, account_id: int) -> Tuple[str, Dict[str, Any]]:
+    for email in get_customer_user_emails(customer_id):
+        for account in get_user_accounts(email):
+            if int(account["id"]) == account_id:
+                return email, account
+    raise HTTPException(status_code=404, detail="Account not found for customer")
+
+
+def find_strategy_for_customer(customer_id: int, strategy_id: int) -> Tuple[str, Dict[str, Any]]:
+    for email in get_customer_user_emails(customer_id):
+        for account in get_user_accounts(email):
+            for strategy in get_account_strategies(int(account["id"])):
+                if int(strategy["id"]) == strategy_id:
+                    return email, strategy
+    raise HTTPException(status_code=404, detail="Strategy not found for customer")
+
+
+def ensure_account_belongs_to_customer(customer_id: int, account_id: int) -> Tuple[str, Dict[str, Any]]:
+    return find_account_for_customer(customer_id, account_id)
+
+
+def risk_multiplier_for_tier(risk_tier: str) -> float:
+    rt = risk_tier.strip().lower()
+    if rt == "conservative":
+        return 0.5
+    if rt == "balanced":
+        return 1.0
+    if rt == "dynamic":
+        return 1.25
+    if rt == "aggressive":
+        return 1.5
+    return 1.0
+
+
+def build_controls(enabled: bool, symbol: str, risk_tier: str) -> Dict[str, Any]:
+    return {
+        "paused": False,
+        "allow_new_entries": enabled,
+        "risk_multiplier": risk_multiplier_for_tier(risk_tier) if enabled else 0.0,
+        "symbol": symbol.upper(),
+        "source": "customer_setup",
+    }
+
+
+def get_latest_risk_snapshot(account: str, magic: str, symbol: str) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT *
+            FROM risk_snapshots
+            WHERE account = ? AND magic = ? AND symbol = ?
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (account, magic, symbol.upper()),
+        ).fetchone()
+    item = row_to_dict(row)
+    if not item:
+        return None
+    return item
+
+
+def build_risk_engine(enabled: bool, account: str, magic: str, symbol: str) -> Dict[str, Any]:
+    snap = get_latest_risk_snapshot(account, magic, symbol)
+    if snap:
+        reasons = []
+        limits = {}
+        try:
+            reasons = json.loads(snap.get("reasons_json") or "[]")
+        except Exception:
+            reasons = []
+        try:
+            limits = json.loads(snap.get("limits_json") or "{}")
+        except Exception:
+            limits = {}
+
+        allow_new_entries = bool(snap.get("allow_new_entries", 1)) and enabled
+        risk_level = str(snap.get("risk_level") or "GREEN").upper()
+        if not enabled:
+            allow_new_entries = False
+            risk_level = "RED"
+            if "STRATEGY_DISABLED" not in reasons:
+                reasons.append("STRATEGY_DISABLED")
+
+        return {
+            "enabled": True,
+            "allow_new_entries": allow_new_entries,
+            "risk_level": risk_level,
+            "daily_pnl": safe_float(snap.get("daily_pnl")),
+            "daily_r": safe_float(snap.get("daily_r")),
+            "daily_trades": safe_int(snap.get("daily_trades")),
+            "limits": limits or {
+                "daily_loss_cap_usd": 250.0,
+                "daily_r_cap": -5.0,
+                "daily_max_trades": 10,
+            },
+            "reasons": reasons or ["NORMAL"],
+            "updated_utc": snap.get("created_utc"),
+        }
+
+    level = "GREEN" if enabled else "RED"
+    return {
+        "enabled": True,
+        "allow_new_entries": enabled,
+        "risk_level": level,
+        "daily_pnl": 0.0,
+        "daily_r": 0.0,
+        "daily_trades": 0,
+        "limits": {
+            "daily_loss_cap_usd": 250.0,
+            "daily_r_cap": -5.0,
+            "daily_max_trades": 10,
+        },
+        "reasons": ["NORMAL" if enabled else "STRATEGY_DISABLED"],
+        "updated_utc": None,
+    }
+
+
+def build_gate_combo_payload(symbol: str, enabled: bool, risk_tier: str, risk_engine: Dict[str, Any]) -> Dict[str, Any]:
+    allow_new_entries = enabled and bool(risk_engine.get("allow_new_entries", True))
+    if not enabled:
+        gate_level = "RED"
+    else:
+        gate_level = str(risk_engine.get("risk_level") or "GREEN").upper()
+
+    multiplier = risk_multiplier_for_tier(risk_tier) if allow_new_entries else 0.0
+
+    return {
+        "ok": True,
+        "symbol": symbol.upper(),
+        "gate_level": gate_level,
+        "allow_new_entries": allow_new_entries,
+        "risk_multiplier": multiplier,
+        "paused": False,
+        "controls": build_controls(allow_new_entries, symbol, risk_tier),
+        "auto_gate": {
+            "gate_level": gate_level,
+            "allow_new_entries": allow_new_entries,
+            "risk_multiplier": multiplier,
+            "reasons": risk_engine.get("reasons", ["NORMAL"]),
+        },
+        "risk_engine": risk_engine,
+        "reasons": risk_engine.get("reasons", ["NORMAL"]),
+    }
+
+
+def build_mock_heartbeat_item(symbol: str) -> Dict[str, Any]:
+    return {
+        "account": "connected",
+        "magic": "n/a",
+        "symbol": symbol.upper(),
+        "ea_name": f"{symbol.upper()} Core EA",
+        "version": "1.0.0",
+        "last_seen_utc": now_utc_iso(),
+        "connected": True,
+        "status": "alive",
+        "comment": "mock heartbeat",
+        "owner_name": "system",
+    }
+
+
+def find_strategy_for_account_symbol_magic(account_number: str, symbol: str, magic: str) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT
+                ca.id AS account_id,
+                ca.account_number,
+                cs.id AS strategy_id,
+                cs.symbol,
+                cs.name,
+                cs.strategy_name,
+                cs.strategy_code,
+                cs.magic,
+                cs.risk_tier,
+                cs.is_enabled,
+                cs.ea_id,
+                u.email AS user_email
+            FROM customer_accounts ca
+            JOIN customer_strategies cs ON cs.account_id = ca.id
+            JOIN users u ON u.email = ca.user_email
+            WHERE ca.account_number = ?
+              AND UPPER(cs.symbol) = ?
+              AND TRIM(cs.magic) = ?
+            ORDER BY cs.id DESC
+            ''',
+            (account_number.strip(), symbol.upper(), str(magic).strip()),
+        ).fetchall()
+
+    for row in rows:
+        item = dict(row)
+        setup = get_strategy_setup(item["user_email"], int(item["account_id"]), symbol.upper())
+        enabled = bool(item["is_enabled"]) and bool(setup["enabled"])
+        return {
+            "id": int(item["strategy_id"]),
+            "account_id": int(item["account_id"]),
+            "symbol": symbol.upper(),
+            "strategy_name": item.get("strategy_name") or item.get("name") or symbol.upper(),
+            "name": item.get("strategy_name") or item.get("name") or symbol.upper(),
+            "strategy_code": item.get("strategy_code"),
+            "magic": str(item["magic"]),
+            "risk_tier": setup["risk_tier"],
+            "enabled": enabled,
+            "is_enabled": bool(item["is_enabled"]),
+            "ea_id": item.get("ea_id"),
+        }
+    return None
+
+
+def get_latest_signal(symbol: str) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT *
+            FROM signals
+            WHERE symbol = ? AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (symbol.upper(),),
+        ).fetchone()
+    signal = row_to_dict(row)
+    if not signal:
+        return None
+    try:
+        signal["payload"] = json.loads(signal.get("payload_json") or "{}")
+    except Exception:
+        signal["payload"] = {}
+    return signal
+
+
+def is_signal_acked(signal_id: int, account: str, magic: str) -> bool:
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT id
+            FROM signal_acks
+            WHERE signal_id = ? AND account = ? AND magic = ?
+            LIMIT 1
+            ''',
+            (signal_id, account, str(magic).strip()),
+        ).fetchone()
+    return row is not None
+
+
+def get_recent_signals(symbol: str, limit: int = 50) -> List[Dict[str, Any]]:
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT *
+            FROM signals
             WHERE symbol = ?
             ORDER BY id DESC
-            LIMIT 200
-            """, (symbol_norm,))
-        else:
-            cur.execute("""
-            SELECT * FROM heartbeats
+            LIMIT ?
+            ''',
+            (symbol.upper(), limit),
+        ).fetchall()
+    items = rows_to_dicts(rows)
+    for item in items:
+        try:
+            item["payload"] = json.loads(item.get("payload_json") or "{}")
+        except Exception:
+            item["payload"] = {}
+    return items
+
+
+def get_recent_acks(symbol: Optional[str] = None, account: Optional[str] = None, magic: Optional[str] = None, limit: int = 100) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM signal_acks WHERE 1=1"
+    params: List[Any] = []
+    if symbol:
+        sql += " AND symbol = ?"
+        params.append(symbol.upper())
+    if account:
+        sql += " AND account = ?"
+        params.append(account)
+    if magic:
+        sql += " AND magic = ?"
+        params.append(str(magic).strip())
+    sql += " ORDER BY id DESC LIMIT ?"
+    params.append(limit)
+
+    with get_db() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    return rows_to_dicts(rows)
+
+
+def build_heartbeat_status(symbol: str) -> Dict[str, Any]:
+    cutoff = now_utc() - timedelta(seconds=HEARTBEAT_TIMEOUT_SEC)
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT *
+            FROM heartbeats
+            WHERE symbol = ?
             ORDER BY id DESC
-            LIMIT 500
-            """)
+            LIMIT 300
+            ''',
+            (symbol.upper(),),
+        ).fetchall()
 
-        rows = cur.fetchall()
-        conn.close()
-
-    latest_map = {}
-    for r in rows:
-        key = f"{r.get('account','')}|{r.get('magic','')}|{r.get('symbol','')}"
+    latest_map: Dict[str, Dict[str, Any]] = {}
+    for row in rows_to_dicts(rows):
+        key = f'{row.get("account","")}|{row.get("magic","")}|{row.get("symbol","")}'
         if key not in latest_map:
-            latest_map[key] = r
+            latest_map[key] = row
 
-    result = []
+    items: List[Dict[str, Any]] = []
     connected_count = 0
-
-    for _, r in latest_map.items():
-        last_seen = parse_dt(r["last_seen_utc"])
+    for row in latest_map.values():
+        last_seen = parse_dt(row.get("last_seen_utc"))
         connected = bool(last_seen and last_seen >= cutoff)
         if connected:
             connected_count += 1
+        row["connected"] = connected
+        items.append(row)
 
-        result.append({
-            "account": r.get("account"),
-            "magic": r.get("magic"),
-            "symbol": r.get("symbol"),
-            "ea_name": r.get("ea_name"),
-            "version": r.get("version"),
-            "last_seen_utc": r.get("last_seen_utc"),
-            "connected": connected,
-            "status": r.get("status"),
-            "comment": r.get("comment"),
-        })
+    if not items:
+        items = [build_mock_heartbeat_item(symbol)]
+        connected_count = 1
 
     return {
         "ok": True,
         "timeout_sec": HEARTBEAT_TIMEOUT_SEC,
         "connected_count": connected_count,
-        "items": result
+        "items": items,
     }
 
 
-def get_deals_filtered(
-    symbol: Optional[str] = None,
-    account: Optional[str] = None,
-    magic: Optional[str] = None,
-    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
-    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
-):
-    dt_from = now_utc() - timedelta(days=lookback_days)
-
-    query = """
-    SELECT *
-    FROM deals
-    WHERE deal_time_utc >= ?
-    """
-    params = [utc_iso(dt_from)]
-
+def get_filtered_deals(symbol: Optional[str] = None, account: Optional[str] = None, magic: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
+    sql = "SELECT * FROM deals WHERE 1=1"
+    params: List[Any] = []
     if symbol:
-        query += " AND symbol = ?"
+        sql += " AND symbol = ?"
         params.append(symbol.upper())
-
     if account:
-        query += " AND account = ?"
+        sql += " AND account = ?"
         params.append(account)
-
     if magic:
-        query += " AND magic = ?"
-        params.append(magic)
+        sql += " AND magic = ?"
+        params.append(str(magic).strip())
+    sql += " ORDER BY deal_time_utc DESC, id DESC LIMIT ?"
+    params.append(limit)
 
-    query += " ORDER BY deal_time_utc DESC LIMIT ?"
-    params.append(limit_trades)
+    with get_db() as conn:
+        rows = conn.execute(sql, params).fetchall()
 
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-        cur.execute(query, params)
-        rows = cur.fetchall()
-        conn.close()
-
-    rows = list(reversed(rows))
-    return rows
+    items = list(reversed(rows_to_dicts(rows)))
+    return items
 
 
 def calc_equity_curve_from_pnl(rows: List[Dict[str, Any]]) -> List[float]:
     curve = [0.0]
     running = 0.0
-    for r in rows:
-        pnl = safe_float(r.get("pnl"), 0.0)
-        running += pnl
+    for row in rows:
+        running += safe_float(row.get("pnl"))
         curve.append(running)
     return curve
 
 
 def calc_max_drawdown_abs(curve: List[float]) -> float:
-    peak = -10**18
+    peak = None
     max_dd = 0.0
     for x in curve:
-        if x > peak:
-            peak = x
-        dd = peak - x
-        if dd > max_dd:
-            max_dd = dd
+        peak = x if peak is None else max(peak, x)
+        max_dd = max(max_dd, peak - x)
     return max_dd
 
 
@@ -469,20 +1664,17 @@ def calc_max_drawdown_pct(curve: List[float]) -> float:
     peak = None
     max_dd_pct = 0.0
     for x in curve:
-        if peak is None or x > peak:
-            peak = x
+        peak = x if peak is None else max(peak, x)
         if peak and peak > 0:
-            dd_pct = ((peak - x) / peak) * 100.0
-            if dd_pct > max_dd_pct:
-                max_dd_pct = dd_pct
+            max_dd_pct = max(max_dd_pct, ((peak - x) / peak) * 100.0)
     return max_dd_pct
 
 
-def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
+def calc_max_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
     max_streak = 0
-    for r in rows:
-        pnl = safe_float(r.get("pnl"), 0.0)
+    for row in rows:
+        pnl = safe_float(row.get("pnl"))
         if pnl < 0:
             streak += 1
             max_streak = max(max_streak, streak)
@@ -493,8 +1685,8 @@ def calc_loss_streak(rows: List[Dict[str, Any]]) -> int:
 
 def calc_current_loss_streak(rows: List[Dict[str, Any]]) -> int:
     streak = 0
-    for r in reversed(rows):
-        pnl = safe_float(r.get("pnl"), 0.0)
+    for row in reversed(rows):
+        pnl = safe_float(row.get("pnl"))
         if pnl < 0:
             streak += 1
         else:
@@ -507,18 +1699,16 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
     wins = 0
     losses = 0
     breakeven = 0
-
     gross_profit = 0.0
     gross_loss = 0.0
     net_pnl = 0.0
-    total_r = 0.0
+    sum_r = 0.0
 
-    for r in rows:
-        pnl = safe_float(r.get("pnl"), 0.0)
-        r_mult = safe_float(r.get("r_multiple"), 0.0)
-
+    for row in rows:
+        pnl = safe_float(row.get("pnl"))
+        r_mult = safe_float(row.get("r_multiple"))
         net_pnl += pnl
-        total_r += r_mult
+        sum_r += r_mult
 
         if pnl > 0:
             wins += 1
@@ -529,613 +1719,1031 @@ def summarize_kpis(rows: List[Dict[str, Any]]) -> Dict[str, Any]:
         else:
             breakeven += 1
 
-    winrate = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
+    winrate_pct = (wins / total_trades * 100.0) if total_trades > 0 else 0.0
     avg_pnl = (net_pnl / total_trades) if total_trades > 0 else 0.0
-    avg_r = (total_r / total_trades) if total_trades > 0 else 0.0
+    avg_r = (sum_r / total_trades) if total_trades > 0 else 0.0
     profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (999.0 if gross_profit > 0 else 0.0)
-
     curve = calc_equity_curve_from_pnl(rows)
-    max_dd_abs = calc_max_drawdown_abs(curve)
-    max_dd_pct = calc_max_drawdown_pct(curve)
-    max_loss_streak = calc_loss_streak(rows)
-    current_loss_streak = calc_current_loss_streak(rows)
-
-    last_trade_time = rows[-1]["deal_time_utc"] if total_trades > 0 else None
 
     return {
         "total_trades": total_trades,
         "wins": wins,
         "losses": losses,
         "breakeven": breakeven,
-        "winrate_pct": round(winrate, 2),
+        "winrate_pct": round(winrate_pct, 2),
         "gross_profit": round(gross_profit, 2),
         "gross_loss": round(gross_loss, 2),
         "net_pnl": round(net_pnl, 2),
         "avg_pnl": round(avg_pnl, 2),
-        "sum_r": round(total_r, 2),
+        "sum_r": round(sum_r, 2),
         "avg_r": round(avg_r, 2),
         "profit_factor": round(profit_factor, 2),
-        "max_drawdown_abs": round(max_dd_abs, 2),
-        "max_drawdown_pct": round(max_dd_pct, 2),
-        "max_loss_streak": max_loss_streak,
-        "current_loss_streak": current_loss_streak,
-        "last_trade_time_utc": last_trade_time,
+        "max_drawdown_abs": round(calc_max_drawdown_abs(curve), 2),
+        "max_drawdown_pct": round(calc_max_drawdown_pct(curve), 2),
+        "max_loss_streak": calc_max_loss_streak(rows),
+        "current_loss_streak": calc_current_loss_streak(rows),
+        "last_trade_time_utc": rows[-1].get("deal_time_utc") if rows else None,
     }
 
 
-def auto_gate_from_kpis(kpi: Dict[str, Any]) -> Dict[str, Any]:
-    if not AUTO_GATE_ENABLED:
-        return {
-            "gate_level": DEFAULT_GATE_LEVEL,
-            "allow_new_entries": DEFAULT_GATE_LEVEL != "RED",
-            "risk_multiplier": 1.0 if DEFAULT_GATE_LEVEL == "GREEN" else 0.5 if DEFAULT_GATE_LEVEL == "YELLOW" else 0.0,
-            "reasons": ["AUTO_GATE_DISABLED"]
-        }
-
-    reasons_red = []
-    reasons_yellow = []
-
-    dd_pct = safe_float(kpi.get("max_drawdown_pct"))
-    cur_loss_streak = safe_int(kpi.get("current_loss_streak"))
-    sum_r = safe_float(kpi.get("sum_r"))
-    winrate = safe_float(kpi.get("winrate_pct"))
-    total_trades = safe_int(kpi.get("total_trades"))
-
-    if dd_pct >= RED_DD_PCT:
-        reasons_red.append(f"MAX_DD_PCT>={RED_DD_PCT}")
-
-    if cur_loss_streak >= RED_LOSS_STREAK:
-        reasons_red.append(f"LOSS_STREAK>={RED_LOSS_STREAK}")
-
-    if sum_r <= RED_R_SUM:
-        reasons_red.append(f"SUM_R<={RED_R_SUM}")
-
-    if total_trades >= 5 and winrate < RED_WINRATE_MIN:
-        reasons_red.append(f"WINRATE<{RED_WINRATE_MIN}")
-
-    if reasons_red:
-        return {
-            "gate_level": "RED",
-            "allow_new_entries": False,
-            "risk_multiplier": 0.0,
-            "reasons": reasons_red
-        }
-
-    if dd_pct >= YELLOW_DD_PCT:
-        reasons_yellow.append(f"MAX_DD_PCT>={YELLOW_DD_PCT}")
-
-    if cur_loss_streak >= YELLOW_LOSS_STREAK:
-        reasons_yellow.append(f"LOSS_STREAK>={YELLOW_LOSS_STREAK}")
-
-    if sum_r <= YELLOW_R_SUM:
-        reasons_yellow.append(f"SUM_R<={YELLOW_R_SUM}")
-
-    if total_trades >= 5 and winrate < YELLOW_WINRATE_MIN:
-        reasons_yellow.append(f"WINRATE<{YELLOW_WINRATE_MIN}")
-
-    if reasons_yellow:
-        return {
-            "gate_level": "YELLOW",
-            "allow_new_entries": True,
-            "risk_multiplier": 0.5,
-            "reasons": reasons_yellow
-        }
-
-    return {
-        "gate_level": "GREEN",
-        "allow_new_entries": True,
-        "risk_multiplier": 1.0,
-        "reasons": ["NORMAL"]
-    }
-
-
-def build_gate_auto(
-    symbol: Optional[str] = None,
-    account: Optional[str] = None,
-    magic: Optional[str] = None,
-    lookback_days: int = DEFAULT_KPI_LOOKBACK_DAYS,
-    limit_trades: int = DEFAULT_KPI_LIMIT_TRADES,
-) -> Dict[str, Any]:
-    rows = get_deals_filtered(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades
-    )
-
-    kpis = summarize_kpis(rows)
-    gate = auto_gate_from_kpis(kpis)
-
-    return {
-        "ok": True,
-        "filters": {
-            "symbol": symbol.upper() if symbol else None,
-            "account": account,
-            "magic": magic,
-            "lookback_days": lookback_days,
-            "limit_trades": limit_trades,
-        },
-        "kpis": kpis,
-        "gate": gate
-    }
-
-
-def build_gate_combo(
-    symbol: Optional[str] = None,
-    account: Optional[str] = None,
-    magic: Optional[str] = None,
-) -> Dict[str, Any]:
-    controls = get_runtime_controls(symbol)
-    auto_payload = build_gate_auto(symbol=symbol, account=account, magic=magic)
-    auto_gate = auto_payload["gate"]
-
-    paused = bool(controls["paused"])
-    controls_allow = bool(controls["allow_new_entries"])
-    auto_allow = bool(auto_gate["allow_new_entries"])
-
-    allow_new_entries = (not paused) and controls_allow and auto_allow
-    final_risk_multiplier = safe_float(controls["risk_multiplier"], 1.0) * safe_float(auto_gate["risk_multiplier"], 1.0)
-
-    gate_level = auto_gate["gate_level"]
-    if paused:
-        gate_level = "RED"
-
-    reasons = []
-    if paused:
-        reasons.append("PAUSED")
-    if not controls_allow:
-        reasons.append("CONTROL_BLOCK")
-    reasons.extend(auto_gate.get("reasons", []))
-
-    return {
-        "ok": True,
-        "symbol": symbol.upper() if symbol else None,
-        "gate_level": gate_level,
-        "allow_new_entries": allow_new_entries,
-        "risk_multiplier": round(final_risk_multiplier, 4),
-        "paused": paused,
-        "controls": controls,
-        "auto_gate": auto_gate,
-        "reasons": reasons
-    }
-
-
-# -------------------------------------------------------------------
-# BASIC ROUTES
-# -------------------------------------------------------------------
 @app.get("/")
-def root():
+def root() -> Dict[str, Any]:
     return {
-        "ok": True,
-        "service": "Signal Agent API",
-        "version": "6.1.0",
-        "server_time_utc": utc_iso()
+        "status": "ok",
+        "service": "signal-agent-api",
+        "version": "7.0.0",
+        "server_time_utc": now_utc_iso(),
+        "db_path": DB_PATH,
     }
 
 
 @app.get("/health")
-def health():
-    return {
-        "status": "ok",
-        "service": "signal-agent-api",
-        "time": utc_iso()
-    }
+def health() -> Dict[str, Any]:
+    return {"status": "ok", "time_utc": now_utc_iso()}
 
 
-# -------------------------------------------------------------------
-# AUTH ROUTES
-# -------------------------------------------------------------------
-@app.post("/login", response_model=TokenResponse)
-def login(data: LoginRequest):
-    username = data.username.strip()
+@app.post("/login", response_model=LoginResponse)
+def login(data: LoginRequest) -> Dict[str, str]:
+    email = data.email.strip().lower()
     password = data.password.strip()
+    user = db_get_user(email)
 
-    if username != APP_USERNAME or password != APP_PASSWORD:
-        raise HTTPException(status_code=401, detail="Invalid username or password")
+    if not user or user["password"] != password:
+        raise HTTPException(status_code=401, detail="Invalid credentials")
 
-    access_token = create_access_token({"sub": username})
-    return {
-        "access_token": access_token,
-        "token_type": "bearer"
-    }
+    if user["role"] == "customer" and user.get("access_status", "active") != "active":
+        raise HTTPException(status_code=403, detail=f'Customer access is {user.get("access_status")}')
 
-
-@app.get("/me", response_model=UserResponse)
-def me(current_user: dict = Depends(get_current_user)):
-    return {"username": current_user["username"]}
+    token = create_token(email=email, role=user["role"])
+    return {"access_token": token, "token_type": "bearer"}
 
 
-# -------------------------------------------------------------------
-# SIGNAL ROUTES
-# -------------------------------------------------------------------
+@app.get("/me")
+def me(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    return current_user
+
+
+@app.get("/accounts")
+def get_accounts(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    return get_user_accounts(current_user["email"])
+
+
+@app.get("/accounts/{account_id}/strategies")
+def get_strategies(account_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    ensure_account_access(current_user["email"], account_id)
+    return get_account_strategies(account_id)
+
+
+@app.get("/customer/accounts")
+def get_customer_accounts(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    require_customer(current_user)
+    return [format_account_payload(item) for item in get_user_accounts(current_user["email"])]
+
+
+@app.post("/customer/accounts")
+def create_customer_account(data: CustomerAccountCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_customer(current_user)
+    email = current_user["email"]
+    broker_name = data.broker_name.strip()
+    account_number = data.account_number.strip()
+    account_label = data.account_label.strip()
+
+    if not broker_name or not account_number or not account_label:
+        raise HTTPException(status_code=422, detail="broker_name, account_number and account_label are required")
+
+    if any(item["account_number"] == account_number for item in get_user_accounts(email)):
+        raise HTTPException(status_code=400, detail="Account number already exists")
+
+    account_id = next_account_id()
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO customer_accounts (
+                id, user_email, account_number, broker, broker_name, account_label, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (account_id, email, account_number, broker_name, broker_name, account_label, 1 if data.is_active else 0),
+        )
+
+    write_audit_log(email, "customer_account_created", f"Created account {account_number}", target_customer_id=current_user.get("customer_id"), target_account_id=account_id)
+    return format_account_payload(find_account_for_user(email, account_id))
+
+
+@app.put("/customer/accounts/{account_id}")
+def update_customer_account(account_id: int, data: CustomerAccountUpdate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_customer(current_user)
+    email = current_user["email"]
+    _ = find_account_for_user(email, account_id)
+
+    broker_name = data.broker_name.strip()
+    account_number = data.account_number.strip()
+    account_label = data.account_label.strip()
+
+    if not broker_name or not account_number or not account_label:
+        raise HTTPException(status_code=422, detail="broker_name, account_number and account_label are required")
+
+    for item in get_user_accounts(email):
+        if int(item["id"]) != account_id and item["account_number"] == account_number:
+            raise HTTPException(status_code=400, detail="Account number already exists")
+
+    with get_db() as conn:
+        conn.execute(
+            '''
+            UPDATE customer_accounts
+            SET broker = ?, broker_name = ?, account_number = ?, account_label = ?, is_active = ?
+            WHERE id = ? AND user_email = ?
+            ''',
+            (broker_name, broker_name, account_number, account_label, 1 if data.is_active else 0, account_id, email),
+        )
+
+    write_audit_log(email, "customer_account_updated", f"Updated account {account_number}", target_customer_id=current_user.get("customer_id"), target_account_id=account_id)
+    return format_account_payload(find_account_for_user(email, account_id))
+
+
+@app.delete("/customer/accounts/{account_id}")
+def disable_customer_account(account_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_customer(current_user)
+    email = current_user["email"]
+    account = find_account_for_user(email, account_id)
+    with get_db() as conn:
+        conn.execute("UPDATE customer_accounts SET is_active = 0 WHERE id = ? AND user_email = ?", (account_id, email))
+    write_audit_log(email, "customer_account_disabled", f'Disabled account {account["account_number"]}', target_customer_id=current_user.get("customer_id"), target_account_id=account_id)
+    return {"ok": True, "message": "Account disabled", "account_id": account_id}
+
+
+@app.get("/customer/strategies")
+def get_customer_strategies(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    require_customer(current_user)
+    items: List[Dict[str, Any]] = []
+    for account in get_user_accounts(current_user["email"]):
+        for strategy in get_account_strategies(int(account["id"])):
+            items.append(format_strategy_payload(strategy))
+    items.sort(key=lambda x: (int(x["account_id"]), x["symbol"], x["magic"]))
+    return items
+
+
+@app.post("/customer/strategies")
+def create_customer_strategy(data: CustomerStrategyCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_customer(current_user)
+    email = current_user["email"]
+
+    if data.account_id is None:
+        raise HTTPException(status_code=422, detail="account_id is required")
+    ensure_account_access(email, data.account_id)
+
+    symbol = data.symbol.strip().upper()
+    strategy_code = data.strategy_code.strip()
+    strategy_name = data.strategy_name.strip()
+    magic = str(data.magic).strip()
+    risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        _ = find_ea(int(ea_id))
+
+    if not symbol or not strategy_code or not strategy_name or not magic:
+        raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
+
+    for item in get_account_strategies(data.account_id):
+        if item["symbol"].upper() == symbol and str(item["magic"]).strip() == magic:
+            raise HTTPException(status_code=400, detail="Strategy with symbol and magic already exists for this account")
+
+    strategy_id = next_strategy_id()
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO customer_strategies (
+                id, account_id, symbol, name, strategy_name, strategy_code, magic, risk_tier, is_enabled, ea_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (strategy_id, data.account_id, symbol, strategy_name, strategy_name, strategy_code, magic, risk_tier, 1 if data.is_enabled else 0, ea_id),
+        )
+
+    set_strategy_setup(email, data.account_id, symbol, bool(data.is_enabled), risk_tier)
+    write_audit_log(email, "customer_strategy_created", f"Created strategy {strategy_code} for {symbol}", target_customer_id=current_user.get("customer_id"), target_account_id=data.account_id, target_strategy_id=strategy_id)
+    return format_strategy_payload(find_strategy_for_user(email, strategy_id))
+
+
+@app.put("/customer/strategies/{strategy_id}")
+def update_customer_strategy(strategy_id: int, data: CustomerStrategyUpdate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_customer(current_user)
+    email = current_user["email"]
+    current_strategy = find_strategy_for_user(email, strategy_id)
+
+    target_account_id = int(data.account_id if data.account_id is not None else current_strategy["account_id"])
+    ensure_account_access(email, target_account_id)
+
+    symbol = data.symbol.strip().upper()
+    strategy_code = data.strategy_code.strip()
+    strategy_name = data.strategy_name.strip()
+    magic = str(data.magic).strip()
+    risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        _ = find_ea(int(ea_id))
+
+    if not symbol or not strategy_code or not strategy_name or not magic:
+        raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
+
+    for item in get_account_strategies(target_account_id):
+        if int(item["id"]) == strategy_id:
+            continue
+        if item["symbol"].upper() == symbol and str(item["magic"]).strip() == magic:
+            raise HTTPException(status_code=400, detail="Strategy with symbol and magic already exists for this account")
+
+    with get_db() as conn:
+        conn.execute(
+            '''
+            UPDATE customer_strategies
+            SET account_id = ?, symbol = ?, name = ?, strategy_name = ?, strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?, ea_id = ?
+            WHERE id = ?
+            ''',
+            (target_account_id, symbol, strategy_name, strategy_name, strategy_code, magic, risk_tier, 1 if data.is_enabled else 0, ea_id, strategy_id),
+        )
+
+    set_strategy_setup(email, target_account_id, symbol, bool(data.is_enabled), risk_tier)
+    write_audit_log(email, "customer_strategy_updated", f"Updated strategy {strategy_code} for {symbol}", target_customer_id=current_user.get("customer_id"), target_account_id=target_account_id, target_strategy_id=strategy_id)
+    return format_strategy_payload(find_strategy_for_user(email, strategy_id))
+
+
+@app.delete("/customer/strategies/{strategy_id}")
+def disable_customer_strategy(strategy_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_customer(current_user)
+    email = current_user["email"]
+    strategy = find_strategy_for_user(email, strategy_id)
+
+    with get_db() as conn:
+        conn.execute("UPDATE customer_strategies SET is_enabled = 0 WHERE id = ?", (strategy_id,))
+
+    set_strategy_setup(email, int(strategy["account_id"]), strategy["symbol"], False, strategy.get("risk_tier", "balanced"))
+    write_audit_log(email, "customer_strategy_disabled", f'Disabled strategy {strategy.get("strategy_code")}', target_customer_id=current_user.get("customer_id"), target_account_id=int(strategy["account_id"]), target_strategy_id=strategy_id)
+    return {"ok": True, "message": "Strategy disabled", "strategy_id": strategy_id}
+
+
+@app.get("/customer/setup")
+def customer_setup(current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    return {"ok": True, "items": get_customer_accounts_with_setup(current_user["email"])}
+
+
+@app.post("/accounts/{account_id}/strategies/{symbol}/setup")
+def update_strategy_setup(account_id: int, symbol: str, data: StrategySetupIn, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    ensure_account_access(current_user["email"], account_id)
+
+    normalized_risk = normalize_risk_tier(data.risk_tier)
+    symbol_upper = symbol.strip().upper()
+    valid_symbols = {str(item["symbol"]).upper() for item in get_account_strategies(account_id)}
+    if symbol_upper not in valid_symbols:
+        raise HTTPException(status_code=404, detail="Strategy not found")
+
+    set_strategy_setup(current_user["email"], account_id, symbol_upper, bool(data.enabled), normalized_risk)
+
+    with get_db() as conn:
+        conn.execute(
+            '''
+            UPDATE customer_strategies
+            SET risk_tier = ?, is_enabled = ?
+            WHERE account_id = ? AND UPPER(symbol) = ?
+            ''',
+            (normalized_risk, 1 if data.enabled else 0, account_id, symbol_upper),
+        )
+
+    return {"ok": True, "account_id": account_id, "symbol": symbol_upper, "enabled": bool(data.enabled), "risk_tier": normalized_risk}
+
+
+@app.get("/master/eas")
+def master_get_eas(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    return [format_ea_payload(item) for item in list_eas()]
+
+
+@app.post("/master/eas")
+def master_create_ea(data: ExpertAdvisorCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+
+    ea_name = data.ea_name.strip()
+    ea_code = data.ea_code.strip().lower()
+    version = data.version.strip() if data.version else None
+    default_symbol = data.default_symbol.strip().upper() if data.default_symbol else None
+    default_magic = str(data.default_magic).strip() if data.default_magic is not None else None
+    download_url = data.download_url.strip() if data.download_url and data.download_url.strip() else ""
+    file_name = data.file_name.strip() if data.file_name and data.file_name.strip() else None
+
+    if not ea_name or not ea_code:
+        raise HTTPException(status_code=422, detail="ea_name and ea_code are required")
+
+    with get_db() as conn:
+        existing = conn.execute("SELECT id FROM expert_advisors WHERE ea_code = ?", (ea_code,)).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail="EA code already exists")
+        ea_id = next_ea_id()
+        conn.execute(
+            '''
+            INSERT INTO expert_advisors (
+                id, ea_name, ea_code, version, default_symbol, default_magic, download_url, file_name, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (ea_id, ea_name, ea_code, version, default_symbol, default_magic, download_url, file_name, 1 if data.is_active else 0),
+        )
+
+    write_audit_log(current_user["email"], "master_ea_created", f"Created EA {ea_name}")
+    return format_ea_payload(find_ea(ea_id))
+
+
+@app.put("/master/eas/{ea_id}")
+def master_update_ea(ea_id: int, data: ExpertAdvisorUpdate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_ea(ea_id)
+
+    ea_name = data.ea_name.strip()
+    ea_code = data.ea_code.strip().lower()
+    version = data.version.strip() if data.version else None
+    default_symbol = data.default_symbol.strip().upper() if data.default_symbol else None
+    default_magic = str(data.default_magic).strip() if data.default_magic is not None else None
+    download_url = data.download_url.strip() if data.download_url and data.download_url.strip() else ""
+    file_name = data.file_name.strip() if data.file_name and data.file_name.strip() else None
+
+    if not ea_name or not ea_code:
+        raise HTTPException(status_code=422, detail="ea_name and ea_code are required")
+
+    with get_db() as conn:
+        existing = conn.execute("SELECT id FROM expert_advisors WHERE ea_code = ? AND id != ?", (ea_code, ea_id)).fetchone()
+        if existing:
+            raise HTTPException(status_code=400, detail="EA code already exists")
+        conn.execute(
+            '''
+            UPDATE expert_advisors
+            SET ea_name = ?, ea_code = ?, version = ?, default_symbol = ?, default_magic = ?, download_url = ?, file_name = ?, is_active = ?
+            WHERE id = ?
+            ''',
+            (ea_name, ea_code, version, default_symbol, default_magic, download_url, file_name, 1 if data.is_active else 0, ea_id),
+        )
+
+    write_audit_log(current_user["email"], "master_ea_updated", f"Updated EA {ea_name}")
+    return format_ea_payload(find_ea(ea_id))
+
+
+@app.delete("/master/eas/{ea_id}")
+def master_disable_ea(ea_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    ea = find_ea(ea_id)
+    with get_db() as conn:
+        conn.execute("UPDATE expert_advisors SET is_active = 0 WHERE id = ?", (ea_id,))
+    write_audit_log(current_user["email"], "master_ea_disabled", f'Disabled EA {ea["ea_name"]}')
+    return {"ok": True, "message": "EA disabled", "ea_id": ea_id}
+
+
+@app.get("/public/eas/{ea_id}/download")
+def public_ea_download(ea_id: int) -> RedirectResponse:
+    ea = find_ea(ea_id)
+    if not bool(ea.get("is_active", True)):
+        raise HTTPException(status_code=404, detail="EA is inactive")
+    download_url = (ea.get("download_url") or "").strip()
+    if not download_url:
+        raise HTTPException(status_code=404, detail="EA download URL not configured")
+    return RedirectResponse(url=download_url, status_code=307)
+
+
+@app.get("/master/customers")
+def master_get_customers(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    with get_db() as conn:
+        rows = conn.execute("SELECT * FROM customers ORDER BY id").fetchall()
+    return [format_customer_payload(dict(row)) for row in rows]
+
+
+@app.post("/master/customers")
+def master_create_customer(data: MasterCustomerCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    display_name = data.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="display_name is required")
+
+    customer_id = next_customer_id()
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO customers (
+                id, display_name, access_start_at, access_end_at, access_status, trading_status, subscription_status, grace_until
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                customer_id,
+                display_name,
+                data.access_start_at,
+                data.access_end_at,
+                normalize_access_status(data.access_status),
+                normalize_trading_status(data.trading_status),
+                normalize_subscription_status(data.subscription_status),
+                data.grace_until,
+            ),
+        )
+
+    write_audit_log(current_user["email"], "master_customer_created", f"Created customer {display_name}", target_customer_id=customer_id)
+    return format_customer_payload(find_customer(customer_id))
+
+
+@app.get("/master/customers/{customer_id}")
+def master_get_customer(customer_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    return format_customer_payload(find_customer(customer_id))
+
+
+@app.put("/master/customers/{customer_id}")
+def master_update_customer(customer_id: int, data: MasterCustomerUpdate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    display_name = data.display_name.strip()
+    if not display_name:
+        raise HTTPException(status_code=422, detail="display_name is required")
+
+    with get_db() as conn:
+        conn.execute(
+            '''
+            UPDATE customers
+            SET display_name = ?, access_start_at = ?, access_end_at = ?, access_status = ?, trading_status = ?, subscription_status = ?, grace_until = ?
+            WHERE id = ?
+            ''',
+            (
+                display_name,
+                data.access_start_at,
+                data.access_end_at,
+                normalize_access_status(data.access_status),
+                normalize_trading_status(data.trading_status),
+                normalize_subscription_status(data.subscription_status),
+                data.grace_until,
+                customer_id,
+            ),
+        )
+    sync_customer_status_to_users(customer_id)
+    write_audit_log(current_user["email"], "master_customer_updated", f"Updated customer {display_name}", target_customer_id=customer_id)
+    return format_customer_payload(find_customer(customer_id))
+
+
+@app.post("/master/users")
+def master_create_customer_user(data: MasterUserCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    email = data.email.strip().lower()
+    password = data.password.strip()
+    display_name = data.display_name.strip()
+    customer_id = int(data.customer_id)
+
+    if not password or not display_name:
+        raise HTTPException(status_code=422, detail="password and display_name are required")
+    if db_get_user(email):
+        raise HTTPException(status_code=400, detail="User email already exists")
+
+    customer = find_customer(customer_id)
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO users (
+                email, password, role, customer_id, display_name, access_status, trading_status, subscription_status
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                email,
+                password,
+                "customer",
+                customer_id,
+                display_name,
+                customer.get("access_status", "active"),
+                customer.get("trading_status", "enabled"),
+                customer.get("subscription_status", "active"),
+            ),
+        )
+    write_audit_log(current_user["email"], "master_customer_user_created", f"Created customer user {email}", target_customer_id=customer_id, target_user_email=email)
+    return {"ok": True, "email": email, "role": "customer", "customer_id": customer_id, "display_name": display_name}
+
+
+@app.get("/master/customers/{customer_id}/accounts")
+def master_get_customer_accounts(customer_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    return get_accounts_for_customer(customer_id)
+
+
+@app.post("/master/customers/{customer_id}/accounts")
+def master_create_customer_account(customer_id: int, data: MasterCustomerAccountCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    owner_email = require_customer_owner_email(customer_id)
+
+    broker_name = data.broker_name.strip()
+    account_number = data.account_number.strip()
+    account_label = data.account_label.strip()
+
+    if not broker_name or not account_number or not account_label:
+        raise HTTPException(status_code=422, detail="broker_name, account_number and account_label are required")
+    if any(item["account_number"] == account_number for item in get_user_accounts(owner_email)):
+        raise HTTPException(status_code=400, detail="Account number already exists")
+
+    account_id = next_account_id()
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO customer_accounts (
+                id, user_email, account_number, broker, broker_name, account_label, is_active
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (account_id, owner_email, account_number, broker_name, broker_name, account_label, 1 if data.is_active else 0),
+        )
+    write_audit_log(current_user["email"], "master_customer_account_created", f"Created customer account {account_number}", target_customer_id=customer_id, target_user_email=owner_email, target_account_id=account_id)
+    return format_account_payload(find_account_for_user(owner_email, account_id))
+
+
+@app.put("/master/customers/{customer_id}/accounts/{account_id}")
+def master_update_customer_account(customer_id: int, account_id: int, data: MasterCustomerAccountUpdate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    owner_email, _account = find_account_for_customer(customer_id, account_id)
+
+    broker_name = data.broker_name.strip()
+    account_number = data.account_number.strip()
+    account_label = data.account_label.strip()
+
+    if not broker_name or not account_number or not account_label:
+        raise HTTPException(status_code=422, detail="broker_name, account_number and account_label are required")
+    for item in get_user_accounts(owner_email):
+        if int(item["id"]) != account_id and item["account_number"] == account_number:
+            raise HTTPException(status_code=400, detail="Account number already exists")
+
+    with get_db() as conn:
+        conn.execute(
+            '''
+            UPDATE customer_accounts
+            SET broker = ?, broker_name = ?, account_number = ?, account_label = ?, is_active = ?
+            WHERE id = ?
+            ''',
+            (broker_name, broker_name, account_number, account_label, 1 if data.is_active else 0, account_id),
+        )
+    write_audit_log(current_user["email"], "master_customer_account_updated", f"Updated customer account {account_number}", target_customer_id=customer_id, target_user_email=owner_email, target_account_id=account_id)
+    return format_account_payload(find_account_for_user(owner_email, account_id))
+
+
+@app.delete("/master/customers/{customer_id}/accounts/{account_id}")
+def master_disable_customer_account(customer_id: int, account_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    owner_email, account = find_account_for_customer(customer_id, account_id)
+    with get_db() as conn:
+        conn.execute("UPDATE customer_accounts SET is_active = 0 WHERE id = ?", (account_id,))
+    write_audit_log(current_user["email"], "master_customer_account_disabled", f'Disabled customer account {account["account_number"]}', target_customer_id=customer_id, target_user_email=owner_email, target_account_id=account_id)
+    return {"ok": True, "message": "Account disabled", "account_id": account_id}
+
+
+@app.get("/master/customers/{customer_id}/strategies")
+def master_get_customer_strategies(customer_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    return get_strategies_for_customer(customer_id)
+
+
+@app.post("/master/customers/{customer_id}/strategies")
+def master_create_customer_strategy(customer_id: int, data: MasterCustomerStrategyCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    owner_email, _account = ensure_account_belongs_to_customer(customer_id, data.account_id)
+
+    symbol = data.symbol.strip().upper()
+    strategy_code = data.strategy_code.strip()
+    strategy_name = data.strategy_name.strip()
+    magic = str(data.magic).strip()
+    risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        _ = find_ea(int(ea_id))
+    if not symbol or not strategy_code or not strategy_name or not magic:
+        raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
+    for item in get_account_strategies(data.account_id):
+        if item["symbol"].upper() == symbol and str(item["magic"]).strip() == magic:
+            raise HTTPException(status_code=400, detail="Strategy with symbol and magic already exists for this account")
+
+    strategy_id = next_strategy_id()
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO customer_strategies (
+                id, account_id, symbol, name, strategy_name, strategy_code, magic, risk_tier, is_enabled, ea_id
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (strategy_id, data.account_id, symbol, strategy_name, strategy_name, strategy_code, magic, risk_tier, 1 if data.is_enabled else 0, ea_id),
+        )
+    set_strategy_setup(owner_email, data.account_id, symbol, bool(data.is_enabled), risk_tier)
+    write_audit_log(current_user["email"], "master_customer_strategy_created", f"Created strategy {strategy_code} for {symbol}", target_customer_id=customer_id, target_user_email=owner_email, target_account_id=data.account_id, target_strategy_id=strategy_id)
+    return format_strategy_payload(find_strategy_for_user(owner_email, strategy_id))
+
+
+@app.put("/master/customers/{customer_id}/strategies/{strategy_id}")
+def master_update_customer_strategy(customer_id: int, strategy_id: int, data: MasterCustomerStrategyUpdate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    owner_email, _old = find_strategy_for_customer(customer_id, strategy_id)
+    target_owner_email, _target_account = ensure_account_belongs_to_customer(customer_id, data.account_id)
+
+    symbol = data.symbol.strip().upper()
+    strategy_code = data.strategy_code.strip()
+    strategy_name = data.strategy_name.strip()
+    magic = str(data.magic).strip()
+    risk_tier = normalize_risk_tier(data.risk_tier)
+    ea_id = data.ea_id
+
+    if ea_id is not None:
+        _ = find_ea(int(ea_id))
+    if not symbol or not strategy_code or not strategy_name or not magic:
+        raise HTTPException(status_code=422, detail="symbol, strategy_code, strategy_name and magic are required")
+    for item in get_account_strategies(data.account_id):
+        if int(item["id"]) == strategy_id:
+            continue
+        if item["symbol"].upper() == symbol and str(item["magic"]).strip() == magic:
+            raise HTTPException(status_code=400, detail="Strategy with symbol and magic already exists for this account")
+
+    with get_db() as conn:
+        conn.execute(
+            '''
+            UPDATE customer_strategies
+            SET account_id = ?, symbol = ?, name = ?, strategy_name = ?, strategy_code = ?, magic = ?, risk_tier = ?, is_enabled = ?, ea_id = ?
+            WHERE id = ?
+            ''',
+            (data.account_id, symbol, strategy_name, strategy_name, strategy_code, magic, risk_tier, 1 if data.is_enabled else 0, ea_id, strategy_id),
+        )
+    set_strategy_setup(target_owner_email, data.account_id, symbol, bool(data.is_enabled), risk_tier)
+    write_audit_log(current_user["email"], "master_customer_strategy_updated", f"Updated strategy {strategy_code} for {symbol}", target_customer_id=customer_id, target_user_email=owner_email, target_account_id=data.account_id, target_strategy_id=strategy_id)
+    return format_strategy_payload(find_strategy_for_user(target_owner_email, strategy_id))
+
+
+@app.delete("/master/customers/{customer_id}/strategies/{strategy_id}")
+def master_disable_customer_strategy(customer_id: int, strategy_id: int, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    _ = find_customer(customer_id)
+    owner_email, strategy = find_strategy_for_customer(customer_id, strategy_id)
+
+    with get_db() as conn:
+        conn.execute("UPDATE customer_strategies SET is_enabled = 0 WHERE id = ?", (strategy_id,))
+    set_strategy_setup(owner_email, int(strategy["account_id"]), strategy["symbol"], False, strategy.get("risk_tier", "balanced"))
+    write_audit_log(current_user["email"], "master_customer_strategy_disabled", f'Disabled strategy {strategy.get("strategy_code")}', target_customer_id=customer_id, target_user_email=owner_email, target_account_id=int(strategy["account_id"]), target_strategy_id=strategy_id)
+    return {"ok": True, "message": "Strategy disabled", "strategy_id": strategy_id}
+
+
+@app.get("/master/audit_logs")
+def master_get_audit_logs(limit: int = Query(default=100, ge=1, le=500), current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
+    require_master(current_user)
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT created_utc, actor_email, action_type, message, target_customer_id, target_user_email, target_account_id, target_strategy_id
+            FROM audit_logs
+            ORDER BY id DESC
+            LIMIT ?
+            ''',
+            (limit,),
+        ).fetchall()
+    return {"ok": True, "count": len(rows), "items": rows_to_dicts(rows)}
+
+
 @app.post("/tv")
-def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None)):
-    req_key = (x_api_key or data.key or "").strip()
-    if req_key != TV_API_KEY:
+def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None, alias="x-api-key")) -> Dict[str, Any]:
+    if (x_api_key or data.key) != TV_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid API key")
 
     symbol = data.symbol.strip().upper()
+    side = normalize_side(data.side or data.action)
+    if side not in ("BUY", "SELL"):
+        raise HTTPException(status_code=422, detail="side/action must be BUY or SELL")
 
-    side_raw = (data.side or data.action or "").strip().upper()
-    if side_raw in ["BUY", "LONG"]:
-        side = "BUY"
-    elif side_raw in ["SELL", "SHORT"]:
-        side = "SELL"
-    else:
-        side = ""
+    payload = dict(data.payload or {})
+    payload["score"] = data.score if data.score is not None else 1.0
+    now_iso = now_utc_iso()
 
-    payload = data.payload or {}
-    payload["tv_id"] = data.id
-    payload["tv_ts"] = data.ts
-    payload["raw_action"] = data.action
-    payload_json = json.dumps(payload, ensure_ascii=False)
-
-    now = utc_iso()
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO signals(symbol, side, payload_json, created_utc, updated_utc, status)
-        VALUES (?, ?, ?, ?, ?, 'pending')
-        """, (symbol, side, payload_json, now, now))
-
+    with get_db() as conn:
+        cur = conn.execute(
+            '''
+            INSERT INTO signals (symbol, side, score, payload_json, created_utc, updated_utc, status)
+            VALUES (?, ?, ?, ?, ?, ?, 'pending')
+            ''',
+            (symbol, side, safe_float(payload.get("score"), 1.0), json.dumps(payload, ensure_ascii=False), now_iso, now_iso),
+        )
         signal_id = cur.lastrowid
-        conn.commit()
-        conn.close()
 
-    return {
-        "ok": True,
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "side": side,
-        "created_utc": now
-    }
+    return {"ok": True, "signal_id": signal_id, "symbol": symbol, "side": side, "created_utc": now_iso}
 
 
 @app.get("/latest")
-def latest_signal(
-    symbol: str = Query(...),
-    account: str = Query(...),
-    magic: Optional[str] = Query(default=None),
-):
-    symbol = symbol.strip().upper()
-    account = account.strip()
+def latest_signal(symbol: str = Query(...), account: str = Query(...), magic: str = Query(...)) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+    strategy = find_strategy_for_account_symbol_magic(account, symbol_upper, magic)
 
-    controls = get_runtime_controls(symbol)
-    gate_payload = build_gate_combo(symbol=symbol, account=account, magic=magic)
-
-    if controls["paused"] or not controls["allow_new_entries"] or not gate_payload["allow_new_entries"]:
+    if strategy is None:
         return {
             "ok": True,
             "has_signal": False,
-            "symbol": symbol,
             "blocked": True,
-            "controls": controls,
-            "gate": gate_payload
+            "reason": "STRATEGY_NOT_ASSIGNED",
+            "symbol": symbol_upper,
+            "controls": {"paused": False, "allow_new_entries": False, "risk_multiplier": 0.0},
+            "gate": {"gate_level": "RED", "allow_new_entries": False, "risk_multiplier": 0.0},
+            "signal": None,
         }
 
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
+    enabled = bool(strategy["enabled"])
+    risk_tier = strategy.get("risk_tier", "balanced")
+    risk_engine = build_risk_engine(enabled, account, magic, symbol_upper)
+    gate_payload = build_gate_combo_payload(symbol_upper, enabled, risk_tier, risk_engine)
 
-        cur.execute("""
-        SELECT s.*
-        FROM signals s
-        WHERE s.symbol = ?
-          AND s.status = 'pending'
-          AND s.side IN ('BUY', 'SELL')
-          AND NOT EXISTS (
-              SELECT 1 FROM signal_acks a
-              WHERE a.signal_id = s.id
-                AND a.account = ?
-                AND COALESCE(a.magic, '') = COALESCE(?, '')
-          )
-        ORDER BY s.id DESC
-        LIMIT 1
-        """, (symbol, account, magic))
-
-        row = cur.fetchone()
-        conn.close()
-
-    if not row:
+    if not gate_payload["allow_new_entries"]:
         return {
             "ok": True,
             "has_signal": False,
-            "symbol": symbol,
-            "blocked": False,
-            "controls": controls,
-            "gate": gate_payload
+            "blocked": True,
+            "reason": "STRATEGY_DISABLED_OR_RISK_BLOCKED",
+            "symbol": symbol_upper,
+            "controls": gate_payload["controls"],
+            "gate": gate_payload,
+            "signal": None,
         }
 
-    try:
-        payload = json.loads(row.get("payload_json") or "{}")
-    except Exception:
-        payload = {}
+    signal = get_latest_signal(symbol_upper)
+    if signal is None:
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": False,
+            "reason": None,
+            "symbol": symbol_upper,
+            "controls": gate_payload["controls"],
+            "gate": gate_payload,
+            "signal": None,
+        }
+
+    if is_signal_acked(int(signal["id"]), account, magic):
+        return {
+            "ok": True,
+            "has_signal": False,
+            "blocked": False,
+            "reason": "ALREADY_ACKED",
+            "symbol": symbol_upper,
+            "controls": gate_payload["controls"],
+            "gate": gate_payload,
+            "signal": None,
+        }
 
     return {
         "ok": True,
         "has_signal": True,
         "blocked": False,
-        "symbol": symbol,
-        "side": row.get("side"),
-        "updated_utc": row.get("updated_utc"),
-        "signal_id": row.get("id"),
-        "payload": payload,
-        "controls": controls,
+        "reason": None,
+        "symbol": symbol_upper,
+        "controls": gate_payload["controls"],
         "gate": gate_payload,
-        "signal": row
+        "execution_engine": {
+            "mode": "customer_setup",
+            "score_to_risk_enabled": True,
+            "score": safe_float(signal.get("score"), 1.0),
+            "priority": "NORMAL",
+            "risk_multiplier": gate_payload["risk_multiplier"],
+            "approved": True,
+            "reasons": gate_payload["reasons"],
+        },
+        "effective_risk_multiplier": gate_payload["risk_multiplier"],
+        "delivery": {
+            "delivery_id": int(signal["id"]),
+            "signal_id": int(signal["id"]),
+            "delivery_status": "pending",
+            "first_seen_utc": signal["created_utc"],
+            "ack_utc": None,
+        },
+        "signal": signal,
     }
 
 
 @app.post("/ack")
-def ack_signal(data: AckIn):
-    symbol = data.symbol.strip().upper()
-    account = data.account.strip()
-    magic = data.magic
+def ack_signal(data: AckIn) -> Dict[str, Any]:
+    symbol_upper = data.symbol.strip().upper()
+    magic = (data.magic or "").strip()
 
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        SELECT *
-        FROM signals
-        WHERE symbol = ?
-          AND updated_utc = ?
-          AND status = 'pending'
-        ORDER BY id DESC
-        LIMIT 1
-        """, (symbol, data.updated_utc))
-
-        row = cur.fetchone()
-        if not row:
-            conn.close()
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT *
+            FROM signals
+            WHERE symbol = ? AND updated_utc = ? AND status = 'pending'
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (symbol_upper, data.updated_utc),
+        ).fetchone()
+        signal = row_to_dict(row)
+        if not signal:
             raise HTTPException(status_code=404, detail="Signal not found")
 
-        signal_id = row["id"]
+        conn.execute(
+            '''
+            INSERT OR IGNORE INTO signal_acks (signal_id, symbol, account, magic, ack_utc, ticket)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ''',
+            (int(signal["id"]), symbol_upper, data.account, magic, now_utc_iso(), data.ticket),
+        )
 
-        cur.execute("""
-        INSERT OR IGNORE INTO signal_acks(signal_id, symbol, account, magic, ack_utc)
-        VALUES (?, ?, ?, ?, ?)
-        """, (signal_id, symbol, account, magic, utc_iso()))
-
-        conn.commit()
-        conn.close()
-
-    return {
-        "ok": True,
-        "signal_id": signal_id,
-        "symbol": symbol,
-        "account": account,
-        "magic": magic
-    }
+    return {"ok": True, "signal_id": int(signal["id"]), "symbol": symbol_upper, "account": data.account, "magic": magic}
 
 
-# -------------------------------------------------------------------
-# HEARTBEAT
-# -------------------------------------------------------------------
 @app.post("/hb")
-def heartbeat(data: HeartbeatPing):
+def heartbeat(data: HeartbeatPing) -> Dict[str, Any]:
     if data.key and data.key != TV_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid key")
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO heartbeats(account, magic, symbol, ea_name, version, last_seen_utc, status, comment)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            data.account,
-            data.magic,
-            data.symbol.upper(),
-            data.ea_name,
-            data.version,
-            utc_iso(),
-            data.status,
-            data.comment
-        ))
-
-        conn.commit()
-        conn.close()
-
-    return {"ok": True, "server_time_utc": utc_iso()}
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO heartbeats (account, magic, symbol, ea_name, version, last_seen_utc, status, comment, owner_name)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (data.account, data.magic, data.symbol.upper(), data.ea_name, data.version, now_utc_iso(), data.status, data.comment, data.owner_name),
+        )
+    return {"ok": True, "server_time_utc": now_utc_iso()}
 
 
 @app.get("/status/heartbeat")
-def heartbeat_status(symbol: Optional[str] = Query(default=None)):
-    return build_heartbeat_status(symbol=symbol)
+def heartbeat_status(symbol: str = Query(...)) -> Dict[str, Any]:
+    return build_heartbeat_status(symbol)
 
 
-# -------------------------------------------------------------------
-# DEALS + RISKS
-# -------------------------------------------------------------------
 @app.post("/deal")
-def post_deal(data: DealIn):
-    deal_time = data.deal_time_utc or utc_iso()
-
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO deals(
-            account, magic, symbol, side, ticket, volume,
-            entry_price, exit_price, sl, tp,
-            pnl, pnl_currency, commission, swap,
-            risk_amount, r_multiple, strategy,
-            deal_time_utc, created_utc
+def post_deal(data: DealIn) -> Dict[str, Any]:
+    deal_time = data.deal_time_utc or now_utc_iso()
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO deals (
+                account, magic, symbol, side, ticket, volume, entry_price, exit_price, sl, tp,
+                pnl, commission, swap, r_multiple, strategy_code, deal_time_utc, created_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                data.account.strip(),
+                str(data.magic).strip(),
+                data.symbol.upper(),
+                data.side,
+                data.ticket,
+                data.volume,
+                data.entry_price,
+                data.exit_price,
+                data.sl,
+                data.tp,
+                safe_float(data.pnl),
+                safe_float(data.commission),
+                safe_float(data.swap),
+                safe_float(data.r_multiple),
+                data.strategy_code,
+                deal_time,
+                now_utc_iso(),
+            ),
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            data.account,
-            data.magic,
-            data.symbol.upper(),
-            data.side,
-            data.ticket,
-            data.volume,
-            data.entry_price,
-            data.exit_price,
-            data.sl,
-            data.tp,
-            data.pnl,
-            data.pnl_currency,
-            data.commission,
-            data.swap,
-            data.risk_amount,
-            data.r_multiple,
-            data.strategy,
-            deal_time,
-            utc_iso()
-        ))
-
-        conn.commit()
-        conn.close()
-
     return {"ok": True}
 
 
 @app.post("/risk")
-def post_risk(data: RiskIn):
-    with DB_LOCK:
-        conn = get_conn()
-        cur = conn.cursor()
-
-        cur.execute("""
-        INSERT INTO risks(account, magic, symbol, event_type, level, message, value, created_utc)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-        """, (
-            data.account,
-            data.magic,
-            data.symbol.upper(),
-            data.event_type,
-            data.level,
-            data.message,
-            data.value,
-            utc_iso()
-        ))
-
-        conn.commit()
-        conn.close()
-
+def post_risk(data: RiskIn) -> Dict[str, Any]:
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO risk_snapshots (
+                account, magic, symbol, risk_level, allow_new_entries, daily_pnl, daily_r, daily_trades,
+                reasons_json, limits_json, created_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                data.account.strip(),
+                str(data.magic).strip(),
+                data.symbol.upper(),
+                data.risk_level.strip().upper(),
+                1 if data.allow_new_entries else 0,
+                safe_float(data.daily_pnl),
+                safe_float(data.daily_r),
+                safe_int(data.daily_trades),
+                json.dumps(data.reasons or [], ensure_ascii=False),
+                json.dumps(data.limits or {
+                    "daily_loss_cap_usd": 250.0,
+                    "daily_r_cap": -5.0,
+                    "daily_max_trades": 10,
+                }, ensure_ascii=False),
+                now_utc_iso(),
+            ),
+        )
     return {"ok": True}
 
 
-# -------------------------------------------------------------------
-# CONTROLS + GATES
-# -------------------------------------------------------------------
-@app.get("/controls/effective")
-def controls_effective(
-    symbol: Optional[str] = Query(default=None),
-    _: bool = Depends(app_token_guard)
-):
+@app.get("/status/system_overview")
+def system_overview(symbol: str = Query(...), account: str = Query(...), magic: str = Query(...)) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+    strategy = find_strategy_for_account_symbol_magic(account, symbol_upper, magic)
+    enabled = bool(strategy["enabled"]) if strategy else False
+    risk_tier = strategy.get("risk_tier", "balanced") if strategy else "balanced"
+    risk_engine = build_risk_engine(enabled, account, magic, symbol_upper)
+    gate_payload = build_gate_combo_payload(symbol_upper, enabled, risk_tier, risk_engine)
+    kpis = summarize_kpis(get_filtered_deals(symbol_upper, account, magic, limit=50))
+
     return {
         "ok": True,
-        "controls": get_runtime_controls(symbol)
+        "server_time_utc": now_utc_iso(),
+        "filters": {"symbol": symbol_upper, "account": account, "magic": magic},
+        "heartbeat": build_heartbeat_status(symbol_upper),
+        "controls": gate_payload["controls"],
+        "kpis": kpis,
+        "gate": gate_payload,
+        "risk_engine": risk_engine,
     }
 
 
-@app.get("/status/gate_auto")
-def gate_auto(
-    symbol: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
-    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
-):
-    return build_gate_auto(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades,
-    )
+@app.get("/status/risk_engine")
+def status_risk_engine(symbol: str = Query(...), account: str = Query(...), magic: str = Query(...)) -> Dict[str, Any]:
+    strategy = find_strategy_for_account_symbol_magic(account, symbol.upper(), magic)
+    enabled = bool(strategy["enabled"]) if strategy else False
+    engine = build_risk_engine(enabled, account, magic, symbol.upper())
+    payload = {"ok": True, "filters": {"symbol": symbol.upper(), "account": account, "magic": magic}, "risk_engine": engine}
+    payload.update(engine)
+    return payload
 
 
 @app.get("/status/gate_combo")
-def gate_combo(
-    symbol: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-):
-    return build_gate_combo(symbol=symbol, account=account, magic=magic)
+def gate_combo(symbol: str = Query(...), account: str = Query(...), magic: str = Query(...)) -> Dict[str, Any]:
+    strategy = find_strategy_for_account_symbol_magic(account, symbol.upper(), magic)
+    enabled = bool(strategy["enabled"]) if strategy else False
+    risk_tier = strategy.get("risk_tier", "balanced") if strategy else "balanced"
+    risk_engine = build_risk_engine(enabled, account, magic, symbol.upper())
+    return build_gate_combo_payload(symbol, enabled, risk_tier, risk_engine)
 
 
-# -------------------------------------------------------------------
-# KPI ENDPOINTS
-# -------------------------------------------------------------------
-@app.get("/kpis/rolling")
-def rolling_kpis(
-    symbol: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
-    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
-):
-    rows = get_deals_filtered(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades
-    )
+@app.get("/debug/state")
+def debug_state(symbol: str = Query(...)) -> Dict[str, Any]:
+    signals = get_recent_signals(symbol.upper(), limit=50)
+    return {"ok": True, "symbol": symbol.upper(), "signals": signals[:10], "deliveries": signals}
 
-    kpis = summarize_kpis(rows)
 
+@app.get("/debug/recent_acks")
+def debug_recent_acks(symbol: Optional[str] = Query(default=None), account: Optional[str] = Query(default=None), magic: Optional[str] = Query(default=None)) -> Dict[str, Any]:
+    items = get_recent_acks(symbol=symbol, account=account, magic=magic, limit=100)
     return {
         "ok": True,
-        "filters": {
-            "symbol": symbol.upper() if symbol else None,
-            "account": account,
-            "magic": magic,
-            "lookback_days": lookback_days,
-            "limit_trades": limit_trades,
-        },
-        "kpis": kpis
+        "count": len(items),
+        "items": items,
+        "acks": items,
+        "filters": {"symbol": symbol.upper() if symbol else None, "account": account, "magic": magic},
     }
 
 
-@app.get("/status/system_overview")
-def system_overview(
-    symbol: Optional[str] = Query(default=None),
-    account: Optional[str] = Query(default=None),
-    magic: Optional[str] = Query(default=None),
-    lookback_days: int = Query(default=DEFAULT_KPI_LOOKBACK_DAYS),
-    limit_trades: int = Query(default=DEFAULT_KPI_LIMIT_TRADES),
-):
-    rows = get_deals_filtered(
-        symbol=symbol,
-        account=account,
-        magic=magic,
-        lookback_days=lookback_days,
-        limit_trades=limit_trades
-    )
+@app.get("/debug/delivery_status")
+def debug_delivery_status(signal_id: int = Query(...)) -> Dict[str, Any]:
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM signals WHERE id = ?", (signal_id,)).fetchone()
+    signal = row_to_dict(row)
+    if signal:
+        try:
+            signal["payload"] = json.loads(signal.get("payload_json") or "{}")
+        except Exception:
+            signal["payload"] = {}
+    return {"ok": True, "signal": signal, "delivery_count": 0, "deliveries": []}
 
-    kpis = summarize_kpis(rows)
-    gate = build_gate_combo(symbol=symbol, account=account, magic=magic)
 
-    heartbeat_payload = {"ok": False, "connected_count": 0, "items": []}
-    try:
-        heartbeat_payload = build_heartbeat_status(symbol=symbol)
-    except Exception:
-        pass
+@app.get("/debug/pending_by_consumer")
+def debug_pending_by_consumer(account: str = Query(...), magic: str = Query(...), symbol: str = Query(...)) -> Dict[str, Any]:
+    latest = get_latest_signal(symbol.upper())
+    items: List[Dict[str, Any]] = []
+    if latest and not is_signal_acked(int(latest["id"]), account, magic):
+        items.append(
+            {
+                "signal_id": int(latest["id"]),
+                "symbol": symbol.upper(),
+                "account": account,
+                "magic": str(magic).strip(),
+                "delivery_status": "pending",
+                "payload": latest.get("payload", {}),
+                "signal_created_utc": latest.get("created_utc"),
+                "signal_updated_utc": latest.get("updated_utc"),
+            }
+        )
+    return {"ok": True, "count": len(items), "items": items, "filters": {"account": account, "magic": magic, "symbol": symbol.upper()}}
 
-    return {
-        "ok": True,
-        "server_time_utc": utc_iso(),
-        "filters": {
-            "symbol": symbol.upper() if symbol else None,
-            "account": account,
-            "magic": magic,
-            "lookback_days": lookback_days,
-            "limit_trades": limit_trades,
-        },
-        "heartbeat": heartbeat_payload,
-        "controls": get_runtime_controls(symbol),
-        "kpis": kpis,
-        "gate": gate
-    }
+
+@app.post("/debug/seed_users")
+def debug_seed_users() -> Dict[str, Any]:
+    return force_seed_defaults()
+
+
+@app.get("/debug/users")
+def debug_users() -> Dict[str, Any]:
+    with get_db() as conn:
+        rows = conn.execute(
+            '''
+            SELECT email, role, customer_id, display_name, access_status, trading_status, subscription_status
+            FROM users
+            ORDER BY email
+            '''
+        ).fetchall()
+    return {"ok": True, "db_path": DB_PATH, "count": len(rows), "items": rows_to_dicts(rows)}
+
+
+if __name__ == "__main__":
+    import uvicorn
+
+    uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
