@@ -389,6 +389,18 @@ class HeartbeatPing(BaseModel):
     owner_name: Optional[str] = None
 
 
+class AccountSnapshotIn(BaseModel):
+    key: Optional[str] = None
+    account: str
+    broker_name: Optional[str] = None
+    balance: float = 0.0
+    equity: float = 0.0
+    margin: float = 0.0
+    free_margin: float = 0.0
+    margin_level: float = 0.0
+    currency: Optional[str] = "USD"
+
+
 class DealIn(BaseModel):
     account: str
     magic: str
@@ -605,6 +617,19 @@ def init_db() -> None:
                 owner_name TEXT
             );
 
+            CREATE TABLE IF NOT EXISTS account_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL,
+                broker_name TEXT,
+                balance REAL NOT NULL DEFAULT 0,
+                equity REAL NOT NULL DEFAULT 0,
+                margin REAL NOT NULL DEFAULT 0,
+                free_margin REAL NOT NULL DEFAULT 0,
+                margin_level REAL NOT NULL DEFAULT 0,
+                currency TEXT,
+                created_utc TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS deals (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 account TEXT NOT NULL,
@@ -655,6 +680,23 @@ def run_db_migrations() -> None:
         strategy_cols = [r["name"] for r in conn.execute("PRAGMA table_info(customer_strategies)").fetchall()]
         if "ea_id" not in strategy_cols:
             conn.execute("ALTER TABLE customer_strategies ADD COLUMN ea_id INTEGER")
+
+        conn.executescript(
+            '''
+            CREATE TABLE IF NOT EXISTS account_snapshots (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                account TEXT NOT NULL,
+                broker_name TEXT,
+                balance REAL NOT NULL DEFAULT 0,
+                equity REAL NOT NULL DEFAULT 0,
+                margin REAL NOT NULL DEFAULT 0,
+                free_margin REAL NOT NULL DEFAULT 0,
+                margin_level REAL NOT NULL DEFAULT 0,
+                currency TEXT,
+                created_utc TEXT NOT NULL
+            );
+            '''
+        )
 
 
 def seed_db_if_empty() -> None:
@@ -1620,6 +1662,54 @@ def build_heartbeat_status(symbol: str) -> Dict[str, Any]:
     }
 
 
+def get_latest_account_snapshot(account: str) -> Optional[Dict[str, Any]]:
+    with get_db() as conn:
+        row = conn.execute(
+            '''
+            SELECT *
+            FROM account_snapshots
+            WHERE account = ?
+            ORDER BY id DESC
+            LIMIT 1
+            ''',
+            (account.strip(),),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def build_account_snapshot(account: str) -> Dict[str, Any]:
+    snap = get_latest_account_snapshot(account)
+
+    if not snap:
+        return {
+            "ok": True,
+            "account": account.strip(),
+            "has_live_data": False,
+            "broker_name": None,
+            "balance": None,
+            "equity": None,
+            "margin": None,
+            "free_margin": None,
+            "margin_level": None,
+            "currency": "USD",
+            "updated_utc": None,
+        }
+
+    return {
+        "ok": True,
+        "account": snap["account"],
+        "has_live_data": True,
+        "broker_name": snap.get("broker_name"),
+        "balance": round(safe_float(snap.get("balance")), 2),
+        "equity": round(safe_float(snap.get("equity")), 2),
+        "margin": round(safe_float(snap.get("margin")), 2),
+        "free_margin": round(safe_float(snap.get("free_margin")), 2),
+        "margin_level": round(safe_float(snap.get("margin_level")), 2),
+        "currency": snap.get("currency") or "USD",
+        "updated_utc": snap.get("created_utc"),
+    }
+
+
 def get_filtered_deals(symbol: Optional[str] = None, account: Optional[str] = None, magic: Optional[str] = None, limit: int = 50) -> List[Dict[str, Any]]:
     sql = "SELECT * FROM deals WHERE 1=1"
     params: List[Any] = []
@@ -2563,9 +2653,56 @@ def heartbeat(data: HeartbeatPing) -> Dict[str, Any]:
     return {"ok": True, "server_time_utc": now_utc_iso()}
 
 
+@app.post("/account_snapshot")
+def post_account_snapshot(data: AccountSnapshotIn) -> Dict[str, Any]:
+    if data.key and data.key != TV_API_KEY:
+        raise HTTPException(status_code=401, detail="Invalid key")
+
+    created_utc = now_utc_iso()
+
+    with get_db() as conn:
+        conn.execute(
+            '''
+            INSERT INTO account_snapshots (
+                account,
+                broker_name,
+                balance,
+                equity,
+                margin,
+                free_margin,
+                margin_level,
+                currency,
+                created_utc
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ''',
+            (
+                data.account.strip(),
+                data.broker_name.strip() if data.broker_name else None,
+                safe_float(data.balance),
+                safe_float(data.equity),
+                safe_float(data.margin),
+                safe_float(data.free_margin),
+                safe_float(data.margin_level),
+                (data.currency or "USD").strip().upper(),
+                created_utc,
+            ),
+        )
+
+    return {
+        "ok": True,
+        "account": data.account.strip(),
+        "updated_utc": created_utc,
+    }
+
+
 @app.get("/status/heartbeat")
 def heartbeat_status(symbol: str = Query(...)) -> Dict[str, Any]:
     return build_heartbeat_status(symbol)
+
+
+@app.get("/status/account_snapshot")
+def status_account_snapshot(account: str = Query(...)) -> Dict[str, Any]:
+    return build_account_snapshot(account)
 
 
 @app.post("/deal")
@@ -2648,6 +2785,7 @@ def system_overview(symbol: str = Query(...), account: str = Query(...), magic: 
         "server_time_utc": now_utc_iso(),
         "filters": {"symbol": symbol_upper, "account": account, "magic": magic},
         "heartbeat": build_heartbeat_status(symbol_upper),
+        "account_snapshot": build_account_snapshot(account),
         "controls": gate_payload["controls"],
         "kpis": kpis,
         "gate": gate_payload,
