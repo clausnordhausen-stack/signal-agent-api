@@ -1,4 +1,4 @@
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezonefrom datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
 import json
@@ -27,6 +27,7 @@ ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
 TV_API_KEY = os.getenv("TV_API_KEY", "supersecret123")
 HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
+ACCOUNT_SNAPSHOT_TIMEOUT_SEC = int(os.getenv("ACCOUNT_SNAPSHOT_TIMEOUT_SEC", "90"))
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
@@ -1679,12 +1680,16 @@ def get_latest_account_snapshot(account: str) -> Optional[Dict[str, Any]]:
 
 def build_account_snapshot(account: str) -> Dict[str, Any]:
     snap = get_latest_account_snapshot(account)
+    account_clean = account.strip()
 
     if not snap:
         return {
             "ok": True,
-            "account": account.strip(),
+            "account": account_clean,
             "has_live_data": False,
+            "is_live": False,
+            "age_seconds": None,
+            "timeout_sec": ACCOUNT_SNAPSHOT_TIMEOUT_SEC,
             "broker_name": None,
             "balance": None,
             "equity": None,
@@ -1695,10 +1700,22 @@ def build_account_snapshot(account: str) -> Dict[str, Any]:
             "updated_utc": None,
         }
 
+    updated_utc = snap.get("created_utc")
+    updated_dt = parse_dt(updated_utc)
+    age_seconds: Optional[int] = None
+    is_live = False
+
+    if updated_dt is not None:
+        age_seconds = max(0, int((now_utc() - updated_dt).total_seconds()))
+        is_live = age_seconds <= ACCOUNT_SNAPSHOT_TIMEOUT_SEC
+
     return {
         "ok": True,
         "account": snap["account"],
         "has_live_data": True,
+        "is_live": is_live,
+        "age_seconds": age_seconds,
+        "timeout_sec": ACCOUNT_SNAPSHOT_TIMEOUT_SEC,
         "broker_name": snap.get("broker_name"),
         "balance": round(safe_float(snap.get("balance")), 2),
         "equity": round(safe_float(snap.get("equity")), 2),
@@ -1706,7 +1723,7 @@ def build_account_snapshot(account: str) -> Dict[str, Any]:
         "free_margin": round(safe_float(snap.get("free_margin")), 2),
         "margin_level": round(safe_float(snap.get("margin_level")), 2),
         "currency": snap.get("currency") or "USD",
-        "updated_utc": snap.get("created_utc"),
+        "updated_utc": updated_utc,
     }
 
 
@@ -2654,8 +2671,12 @@ def heartbeat(data: HeartbeatPing) -> Dict[str, Any]:
 
 
 @app.post("/account_snapshot")
-def post_account_snapshot(data: AccountSnapshotIn) -> Dict[str, Any]:
-    if data.key and data.key != TV_API_KEY:
+def post_account_snapshot(
+    data: AccountSnapshotIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Dict[str, Any]:
+    provided_key = (x_api_key or data.key or "").strip()
+    if provided_key and provided_key != TV_API_KEY:
         raise HTTPException(status_code=401, detail="Invalid key")
 
     created_utc = now_utc_iso()
