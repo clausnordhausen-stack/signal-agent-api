@@ -1,8 +1,12 @@
 from datetime import datetime, timedelta, timezone
 from typing import Any, Dict, List, Optional, Tuple
 
+import base64
+import hashlib
+import hmac
 import json
 import os
+import secrets
 import sqlite3
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Query
@@ -14,18 +18,42 @@ from pydantic import BaseModel, EmailStr
 
 app = FastAPI(title="Signal Agent API", version="7.0.0")
 
+
+APP_ENV = os.getenv("APP_ENV", "development").strip().lower()
+
+
+def _read_secret(name: str, dev_fallback: str) -> str:
+    value = os.getenv(name, "").strip()
+    if value:
+        return value
+    if APP_ENV == "production":
+        raise RuntimeError(f"{name} must be set in production")
+    return dev_fallback
+
+
+def _read_cors_origins() -> List[str]:
+    raw = os.getenv("CORS_ALLOW_ORIGINS", "").strip()
+    if raw:
+        return [item.strip() for item in raw.split(",") if item.strip()]
+    if APP_ENV == "production":
+        raise RuntimeError("CORS_ALLOW_ORIGINS must be set in production")
+    return ["*"]
+
+
+CORS_ALLOW_ORIGINS = _read_cors_origins()
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
+    allow_origins=CORS_ALLOW_ORIGINS,
+    allow_credentials="*" not in CORS_ALLOW_ORIGINS,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-SECRET_KEY = os.getenv("SECRET_KEY", "supersecret123")
+SECRET_KEY = _read_secret("SECRET_KEY", "dev-secret-change-me")
 ALGORITHM = "HS256"
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
-TV_API_KEY = os.getenv("TV_API_KEY", "supersecret123")
+TV_API_KEY = _read_secret("TV_API_KEY", "dev-tv-key-change-me")
 HEARTBEAT_TIMEOUT_SEC = int(os.getenv("HEARTBEAT_TIMEOUT_SEC", "90"))
 ACCOUNT_SNAPSHOT_TIMEOUT_SEC = int(os.getenv("ACCOUNT_SNAPSHOT_TIMEOUT_SEC", "90"))
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
@@ -371,6 +399,7 @@ class TVSignalIn(BaseModel):
 
 
 class AckIn(BaseModel):
+    key: Optional[str] = None
     symbol: str
     updated_utc: str
     account: str
@@ -403,6 +432,7 @@ class AccountSnapshotIn(BaseModel):
 
 
 class DealIn(BaseModel):
+    key: Optional[str] = None
     account: str
     magic: str
     symbol: str
@@ -422,6 +452,7 @@ class DealIn(BaseModel):
 
 
 class RiskIn(BaseModel):
+    key: Optional[str] = None
     account: str
     magic: str
     symbol: str
@@ -485,6 +516,74 @@ def safe_int(value: Any, default: int = 0) -> int:
         return int(value)
     except Exception:
         return default
+
+
+PASSWORD_HASH_SCHEME = "pbkdf2_sha256"
+PASSWORD_HASH_ITERATIONS = int(os.getenv("PASSWORD_HASH_ITERATIONS", "390000"))
+
+
+def hash_password(password: str, *, salt: Optional[str] = None) -> str:
+    if not password:
+        raise ValueError("password must not be empty")
+
+    salt = salt or secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac(
+        "sha256",
+        password.encode("utf-8"),
+        salt.encode("utf-8"),
+        PASSWORD_HASH_ITERATIONS,
+    )
+    encoded = base64.b64encode(digest).decode("utf-8")
+    return f"{PASSWORD_HASH_SCHEME}${PASSWORD_HASH_ITERATIONS}${salt}${encoded}"
+
+
+def verify_password(password: str, stored_value: str) -> bool:
+    if not stored_value:
+        return False
+
+    prefix = f"{PASSWORD_HASH_SCHEME}$"
+    if stored_value.startswith(prefix):
+        try:
+            _, iterations_text, salt, expected = stored_value.split("$", 3)
+            digest = hashlib.pbkdf2_hmac(
+                "sha256",
+                password.encode("utf-8"),
+                salt.encode("utf-8"),
+                int(iterations_text),
+            )
+            candidate = base64.b64encode(digest).decode("utf-8")
+            return hmac.compare_digest(candidate, expected)
+        except Exception:
+            return False
+
+    return hmac.compare_digest(password, stored_value)
+
+
+def maybe_upgrade_password_hash(email: str, raw_password: str) -> None:
+    user = db_get_user(email)
+    if not user:
+        return
+
+    stored_value = str(user.get("password") or "")
+    if stored_value.startswith(f"{PASSWORD_HASH_SCHEME}$"):
+        return
+    if not hmac.compare_digest(stored_value, raw_password):
+        return
+
+    with get_db() as conn:
+        conn.execute(
+            "UPDATE users SET password = ? WHERE email = ?",
+            (hash_password(raw_password), email),
+        )
+
+
+def require_machine_api_key(
+    header_key: Optional[str] = None,
+    body_key: Optional[str] = None,
+) -> None:
+    provided = (header_key or body_key or "").strip()
+    if not provided or not hmac.compare_digest(provided, TV_API_KEY):
+        raise HTTPException(status_code=401, detail="Invalid API key")
 
 
 def build_public_ea_download_url(ea_id: int) -> Optional[str]:
@@ -736,7 +835,7 @@ def seed_db_if_empty() -> None:
                 ''',
                 (
                     email,
-                    user["password"],
+                    hash_password(user["password"]),
                     user["role"],
                     user.get("customer_id"),
                     user.get("display_name", email),
@@ -1875,11 +1974,13 @@ def login(data: LoginRequest) -> Dict[str, str]:
     password = data.password.strip()
     user = db_get_user(email)
 
-    if not user or user["password"] != password:
+    if not user or not verify_password(password, str(user["password"])):
         raise HTTPException(status_code=401, detail="Invalid credentials")
 
     if user["role"] == "customer" and user.get("access_status", "active") != "active":
         raise HTTPException(status_code=403, detail=f'Customer access is {user.get("access_status")}')
+
+    maybe_upgrade_password_hash(email, password)
 
     token = create_token(email=email, role=user["role"])
     return {"access_token": token, "token_type": "bearer"}
@@ -2310,7 +2411,7 @@ def master_create_customer_user(data: MasterUserCreate, current_user: Dict[str, 
             ''',
             (
                 email,
-                password,
+                hash_password(password),
                 "customer",
                 customer_id,
                 display_name,
@@ -2510,9 +2611,11 @@ def master_get_audit_logs(limit: int = Query(default=100, ge=1, le=500), current
 
 
 @app.post("/tv")
-def tv_signal(data: TVSignalIn, x_api_key: Optional[str] = Header(default=None, alias="x-api-key")) -> Dict[str, Any]:
-    if (x_api_key or data.key) != TV_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid API key")
+def tv_signal(
+    data: TVSignalIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Dict[str, Any]:
+    require_machine_api_key(x_api_key, data.key)
 
     symbol = data.symbol.strip().upper()
     side = normalize_side(data.side or data.action)
@@ -2625,7 +2728,12 @@ def latest_signal(symbol: str = Query(...), account: str = Query(...), magic: st
 
 
 @app.post("/ack")
-def ack_signal(data: AckIn) -> Dict[str, Any]:
+def ack_signal(
+    data: AckIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Dict[str, Any]:
+    require_machine_api_key(x_api_key, data.key)
+
     symbol_upper = data.symbol.strip().upper()
     magic = (data.magic or "").strip()
 
@@ -2656,9 +2764,12 @@ def ack_signal(data: AckIn) -> Dict[str, Any]:
 
 
 @app.post("/hb")
-def heartbeat(data: HeartbeatPing) -> Dict[str, Any]:
-    if data.key and data.key != TV_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid key")
+def heartbeat(
+    data: HeartbeatPing,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Dict[str, Any]:
+    require_machine_api_key(x_api_key, data.key)
+
     with get_db() as conn:
         conn.execute(
             '''
@@ -2675,9 +2786,7 @@ def post_account_snapshot(
     data: AccountSnapshotIn,
     x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
 ) -> Dict[str, Any]:
-    provided_key = (x_api_key or data.key or "").strip()
-    if provided_key and provided_key != TV_API_KEY:
-        raise HTTPException(status_code=401, detail="Invalid key")
+    require_machine_api_key(x_api_key, data.key)
 
     created_utc = now_utc_iso()
 
@@ -2727,7 +2836,12 @@ def status_account_snapshot(account: str = Query(...)) -> Dict[str, Any]:
 
 
 @app.post("/deal")
-def post_deal(data: DealIn) -> Dict[str, Any]:
+def post_deal(
+    data: DealIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Dict[str, Any]:
+    require_machine_api_key(x_api_key, data.key)
+
     deal_time = data.deal_time_utc or now_utc_iso()
     with get_db() as conn:
         conn.execute(
@@ -2761,7 +2875,12 @@ def post_deal(data: DealIn) -> Dict[str, Any]:
 
 
 @app.post("/risk")
-def post_risk(data: RiskIn) -> Dict[str, Any]:
+def post_risk(
+    data: RiskIn,
+    x_api_key: Optional[str] = Header(default=None, alias="x-api-key"),
+) -> Dict[str, Any]:
+    require_machine_api_key(x_api_key, data.key)
+
     with get_db() as conn:
         conn.execute(
             '''
@@ -2885,12 +3004,21 @@ def debug_pending_by_consumer(account: str = Query(...), magic: str = Query(...)
 
 
 @app.post("/debug/seed_users")
-def debug_seed_users() -> Dict[str, Any]:
+def debug_seed_users(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+    if APP_ENV == "production":
+        raise HTTPException(status_code=403, detail="Not allowed in production")
     return force_seed_defaults()
 
 
 @app.get("/debug/users")
-def debug_users() -> Dict[str, Any]:
+def debug_users(
+    current_user: Dict[str, Any] = Depends(get_current_user),
+) -> Dict[str, Any]:
+    require_master(current_user)
+
     with get_db() as conn:
         rows = conn.execute(
             '''
