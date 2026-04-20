@@ -1596,9 +1596,20 @@ def build_mock_heartbeat_item(symbol: str) -> Dict[str, Any]:
 
 
 def find_strategy_for_account_symbol_magic(account_number: str, symbol: str, magic: str) -> Optional[Dict[str, Any]]:
+    symbol_clean = symbol.strip().upper()
+
+    symbol_variants = {symbol_clean}
+    if symbol_clean.endswith("USD"):
+        symbol_variants.add(symbol_clean[:-3])
+    else:
+        symbol_variants.add(f"{symbol_clean}USD")
+
+    placeholders = ",".join(["?"] * len(symbol_variants))
+    params: List[Any] = [account_number.strip(), *sorted(symbol_variants), str(magic).strip()]
+
     with get_db() as conn:
         rows = conn.execute(
-            '''
+            f'''
             SELECT
                 ca.id AS account_id,
                 ca.account_number,
@@ -1616,23 +1627,23 @@ def find_strategy_for_account_symbol_magic(account_number: str, symbol: str, mag
             JOIN customer_strategies cs ON cs.account_id = ca.id
             JOIN users u ON u.email = ca.user_email
             WHERE ca.account_number = ?
-              AND UPPER(cs.symbol) = ?
+              AND UPPER(cs.symbol) IN ({placeholders})
               AND TRIM(cs.magic) = ?
             ORDER BY cs.id DESC
             ''',
-            (account_number.strip(), symbol.upper(), str(magic).strip()),
+            params,
         ).fetchall()
 
     for row in rows:
         item = dict(row)
-        setup = get_strategy_setup(item["user_email"], int(item["account_id"]), symbol.upper())
+        setup = get_strategy_setup(item["user_email"], int(item["account_id"]), str(item["symbol"]).upper())
         enabled = bool(item["is_enabled"]) and bool(setup["enabled"])
         return {
             "id": int(item["strategy_id"]),
             "account_id": int(item["account_id"]),
-            "symbol": symbol.upper(),
-            "strategy_name": item.get("strategy_name") or item.get("name") or symbol.upper(),
-            "name": item.get("strategy_name") or item.get("name") or symbol.upper(),
+            "symbol": str(item["symbol"]).upper(),
+            "strategy_name": item.get("strategy_name") or item.get("name") or str(item["symbol"]).upper(),
+            "name": item.get("strategy_name") or item.get("name") or str(item["symbol"]).upper(),
             "strategy_code": item.get("strategy_code"),
             "magic": str(item["magic"]),
             "risk_tier": setup["risk_tier"],
