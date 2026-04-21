@@ -2980,9 +2980,19 @@ def gate_combo(symbol: str = Query(...), account: str = Query(...), magic: str =
 
 
 @app.get("/debug/state")
-def debug_state(symbol: str = Query(...)) -> Dict[str, Any]:
-    signals = get_recent_signals(symbol.upper(), limit=50)
-    return {"ok": True, "symbol": symbol.upper(), "signals": signals[:10], "deliveries": signals}
+def debug_state(symbol: str = Query(...), account: Optional[str] = None, magic: Optional[str] = None) -> Dict[str, Any]:
+    symbol_upper = symbol.upper()
+
+    signals = get_recent_signals(symbol_upper, limit=50)
+    deals = get_filtered_deals(symbol_upper, account, magic, limit=50)
+
+    return {
+        "ok": True,
+        "symbol": symbol_upper,
+        "signals": signals[:10],
+        "deals": deals,
+        "count_deals": len(deals)
+    }
 
 
 @app.get("/debug/recent_acks")
