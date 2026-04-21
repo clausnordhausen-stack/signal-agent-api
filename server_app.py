@@ -1499,8 +1499,8 @@ def get_latest_risk_snapshot(account: str, magic: str, symbol: str) -> Optional[
 def build_risk_engine(enabled: bool, account: str, magic: str, symbol: str) -> Dict[str, Any]:
     snap = get_latest_risk_snapshot(account, magic, symbol)
     if snap:
-        reasons = []
-        limits = {}
+        reasons: List[str] = []
+        limits: Dict[str, Any] = {}
         try:
             reasons = json.loads(snap.get("reasons_json") or "[]")
         except Exception:
@@ -1510,9 +1510,25 @@ def build_risk_engine(enabled: bool, account: str, magic: str, symbol: str) -> D
         except Exception:
             limits = {}
 
+        daily_pnl = safe_float(snap.get("daily_pnl"))
+        daily_r = safe_float(snap.get("daily_r"))
+        daily_trades = safe_int(snap.get("daily_trades"))
+
         allow_new_entries = bool(snap.get("allow_new_entries", 1)) and enabled
         risk_level = str(snap.get("risk_level") or "GREEN").upper()
-        if not enabled:
+
+        if enabled:
+            reasons = [reason for reason in reasons if reason != "STRATEGY_DISABLED"]
+
+            if not reasons:
+                reasons = ["NORMAL"]
+
+            if reasons == ["NORMAL"] and risk_level == "RED" and not bool(snap.get("allow_new_entries", 1)):
+                allow_new_entries = True
+                risk_level = "GREEN"
+            else:
+                allow_new_entries = bool(snap.get("allow_new_entries", 1))
+        else:
             allow_new_entries = False
             risk_level = "RED"
             if "STRATEGY_DISABLED" not in reasons:
@@ -1522,9 +1538,9 @@ def build_risk_engine(enabled: bool, account: str, magic: str, symbol: str) -> D
             "enabled": True,
             "allow_new_entries": allow_new_entries,
             "risk_level": risk_level,
-            "daily_pnl": safe_float(snap.get("daily_pnl")),
-            "daily_r": safe_float(snap.get("daily_r")),
-            "daily_trades": safe_int(snap.get("daily_trades")),
+            "daily_pnl": daily_pnl,
+            "daily_r": daily_r,
+            "daily_trades": daily_trades,
             "limits": limits or {
                 "daily_loss_cap_usd": 250.0,
                 "daily_r_cap": -5.0,
