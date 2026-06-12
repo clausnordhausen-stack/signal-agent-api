@@ -59,6 +59,19 @@ ACCOUNT_SNAPSHOT_TIMEOUT_SEC = int(os.getenv("ACCOUNT_SNAPSHOT_TIMEOUT_SEC", "90
 DB_PATH = os.getenv("DB_PATH", "signal_agent.db")
 PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
 
+# Runtime cleanup keeps high-frequency MT5/TV tables from growing without limit.
+# It does not change the database schema and can be tuned through Render Environment.
+RUNTIME_CLEANUP_ENABLED = os.getenv("RUNTIME_CLEANUP_ENABLED", "1").strip() != "0"
+RUNTIME_CLEANUP_INTERVAL_SEC = int(os.getenv("RUNTIME_CLEANUP_INTERVAL_SEC", "900"))
+HEARTBEAT_RETENTION_HOURS = int(os.getenv("HEARTBEAT_RETENTION_HOURS", "24"))
+ACCOUNT_SNAPSHOT_RETENTION_HOURS = int(os.getenv("ACCOUNT_SNAPSHOT_RETENTION_HOURS", "24"))
+RISK_SNAPSHOT_RETENTION_HOURS = int(os.getenv("RISK_SNAPSHOT_RETENTION_HOURS", "24"))
+SIGNAL_RETENTION_DAYS = int(os.getenv("SIGNAL_RETENTION_DAYS", "7"))
+ACK_RETENTION_DAYS = int(os.getenv("ACK_RETENTION_DAYS", "7"))
+DEAL_RETENTION_DAYS = int(os.getenv("DEAL_RETENTION_DAYS", "365"))
+
+_RUNTIME_CLEANUP_LAST_UTC: Optional[datetime] = None
+
 oauth2_scheme = OAuth2PasswordBearer(tokenUrl="login")
 
 
@@ -799,6 +812,70 @@ def run_db_migrations() -> None:
         )
 
 
+def cleanup_old_runtime_data(force: bool = False) -> None:
+    """Delete old high-frequency runtime rows.
+
+    This is intentionally conservative:
+    - customer/master data is never touched
+    - audit logs are never touched
+    - deals are retained much longer than heartbeats/snapshots
+    """
+
+    global _RUNTIME_CLEANUP_LAST_UTC
+
+    if not RUNTIME_CLEANUP_ENABLED:
+        return
+
+    current = now_utc()
+    if (
+        not force
+        and _RUNTIME_CLEANUP_LAST_UTC is not None
+        and (current - _RUNTIME_CLEANUP_LAST_UTC).total_seconds()
+        < RUNTIME_CLEANUP_INTERVAL_SEC
+    ):
+        return
+
+    heartbeat_cutoff = (current - timedelta(hours=HEARTBEAT_RETENTION_HOURS)).isoformat()
+    account_cutoff = (
+        current - timedelta(hours=ACCOUNT_SNAPSHOT_RETENTION_HOURS)
+    ).isoformat()
+    risk_cutoff = (current - timedelta(hours=RISK_SNAPSHOT_RETENTION_HOURS)).isoformat()
+    signal_cutoff = (current - timedelta(days=SIGNAL_RETENTION_DAYS)).isoformat()
+    ack_cutoff = (current - timedelta(days=ACK_RETENTION_DAYS)).isoformat()
+    deal_cutoff = (current - timedelta(days=DEAL_RETENTION_DAYS)).isoformat()
+
+    try:
+        with get_db() as conn:
+            conn.execute(
+                "DELETE FROM heartbeats WHERE last_seen_utc < ?",
+                (heartbeat_cutoff,),
+            )
+            conn.execute(
+                "DELETE FROM account_snapshots WHERE created_utc < ?",
+                (account_cutoff,),
+            )
+            conn.execute(
+                "DELETE FROM risk_snapshots WHERE created_utc < ?",
+                (risk_cutoff,),
+            )
+            conn.execute(
+                "DELETE FROM signal_acks WHERE ack_utc < ?",
+                (ack_cutoff,),
+            )
+            conn.execute(
+                "DELETE FROM signals WHERE created_utc < ?",
+                (signal_cutoff,),
+            )
+            conn.execute(
+                "DELETE FROM deals WHERE created_utc < ?",
+                (deal_cutoff,),
+            )
+        _RUNTIME_CLEANUP_LAST_UTC = current
+    except Exception:
+        # Cleanup must never block signal delivery or customer login.
+        _RUNTIME_CLEANUP_LAST_UTC = current
+
+
 def seed_db_if_empty() -> None:
     with get_db() as conn:
         existing = conn.execute("SELECT COUNT(*) AS c FROM users").fetchone()["c"]
@@ -955,6 +1032,7 @@ def startup_event() -> None:
     init_db()
     run_db_migrations()
     seed_db_if_empty()
+    cleanup_old_runtime_data(force=True)
 
 
 def create_token(email: str, role: str) -> str:
@@ -2663,6 +2741,7 @@ def tv_signal(
         )
         signal_id = cur.lastrowid
 
+    cleanup_old_runtime_data()
     return {"ok": True, "signal_id": signal_id, "symbol": symbol, "side": side, "created_utc": now_iso}
 
 
@@ -2787,6 +2866,7 @@ def ack_signal(
             (int(signal["id"]), symbol_upper, data.account, magic, now_utc_iso(), data.ticket),
         )
 
+    cleanup_old_runtime_data()
     return {"ok": True, "signal_id": int(signal["id"]), "symbol": symbol_upper, "account": data.account, "magic": magic}
 
 
@@ -2805,6 +2885,7 @@ def heartbeat(
             ''',
             (data.account, data.magic, data.symbol.upper(), data.ea_name, data.version, now_utc_iso(), data.status, data.comment, data.owner_name),
         )
+    cleanup_old_runtime_data()
     return {"ok": True, "server_time_utc": now_utc_iso()}
 
 
@@ -2845,6 +2926,7 @@ def post_account_snapshot(
             ),
         )
 
+    cleanup_old_runtime_data()
     return {
         "ok": True,
         "account": data.account.strip(),
@@ -2898,6 +2980,7 @@ def post_deal(
                 now_utc_iso(),
             ),
         )
+    cleanup_old_runtime_data()
     return {"ok": True}
 
 
@@ -2934,6 +3017,7 @@ def post_risk(
                 now_utc_iso(),
             ),
         )
+    cleanup_old_runtime_data()
     return {"ok": True}
 
 
@@ -3070,4 +3154,4 @@ def debug_users(
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("main:app", host="0.0.0.0", port=10000, reload=True)
+    uvicorn.run("server_app:app", host="0.0.0.0", port=10000, reload=True)
