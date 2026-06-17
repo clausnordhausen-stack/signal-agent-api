@@ -1070,7 +1070,11 @@ def get_current_user(token: str = Depends(oauth2_scheme)) -> Dict[str, Any]:
 
 
 def require_customer(current_user: Dict[str, Any]) -> None:
-    if current_user["role"] != "customer":
+    # Customer endpoints are used by the customer-facing app area.
+    # During the current TradingGuard build, the master login may also open
+    # this area for testing and internal operation. Therefore both roles are
+    # allowed here. Strict master-only routes remain protected by require_master().
+    if current_user["role"] not in ("customer", "master"):
         raise HTTPException(status_code=403, detail="Not allowed")
 
 
