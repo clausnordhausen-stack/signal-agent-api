@@ -2195,6 +2195,18 @@ def get_customer_strategies(current_user: Dict[str, Any] = Depends(get_current_u
     return items
 
 
+
+
+@app.get("/customer/eas")
+def get_customer_eas(current_user: Dict[str, Any] = Depends(get_current_user)) -> List[Dict[str, Any]]:
+    require_customer(current_user)
+    return [
+        format_ea_payload(item)
+        for item in list_eas()
+        if bool(item.get("is_active", True))
+    ]
+
+
 @app.post("/customer/strategies")
 def create_customer_strategy(data: CustomerStrategyCreate, current_user: Dict[str, Any] = Depends(get_current_user)) -> Dict[str, Any]:
     require_customer(current_user)
